@@ -1,0 +1,2438 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: AWS-native Schach-Simulation mit S3, DynamoDB, SNS-Analyse und API Gateway
+
+Resources:
+
+  # 1. S3 Bucket für das Frontend
+  WebsiteBucketV2:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub "schach-simulation-bucket-${AWS::AccountId}"
+
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: false
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: false
+
+      WebsiteConfiguration:
+        IndexDocument: index.html
+        ErrorDocument: error.html
+
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders:
+              - "*"
+            AllowedMethods:
+              - GET
+            AllowedOrigins:
+              - "*"
+
+
+  # 2. S3 Bucket Policy
+  WebsiteBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref WebsiteBucketV2
+
+      PolicyDocument:
+        Version: '2012-10-17'
+
+        Statement:
+          - Sid: PublicReadOnly
+            Effect: Allow
+            Principal: "*"
+
+            Action:
+              - s3:GetObject
+
+            Resource:
+              - !Sub "${WebsiteBucketV2.Arn}/*"
+
+
+  # 3. Privater S3 Bucket für Uploads
+  SubmissionBucket:
+    Type: AWS::S3::Bucket
+
+    Properties:
+      BucketName: !Sub "schach-submissions-${AWS::AccountId}"
+
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders:
+              - "*"
+            AllowedMethods:
+              - POST
+            AllowedOrigins:
+              - "*"
+
+      LifecycleConfiguration:
+        Rules:
+
+          - Id: DeleteOldUploads
+            Status: Enabled
+            Prefix: uploads/
+            ExpirationInDays: 1
+
+
+  # 4. DynamoDB Tabelle
+  SchachSubmissionsTable:
+    Type: AWS::DynamoDB::Table
+
+    Properties:
+      TableName: schach-submissions
+
+      BillingMode: PAY_PER_REQUEST
+
+      AttributeDefinitions:
+        - AttributeName: Token
+          AttributeType: S
+
+      KeySchema:
+        - AttributeName: Token
+          KeyType: HASH
+
+      TimeToLiveSpecification:
+        AttributeName: ExpiresAt
+        Enabled: true
+
+
+  # 5. Nutzerzuordnung: stabile interne UserId pro E-Mail-Adresse
+  SchachUsersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: schach-users
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: Email
+          AttributeType: S
+      KeySchema:
+        - AttributeName: Email
+          KeyType: HASH
+
+
+  # 6. SNS Topic für Benachrichtigungen
+  #
+  # SES wird bewusst nicht verwendet, da dieses Projekt
+  # in einer SES-Sandbox betrieben wird.
+  #
+  # SNS wird hier weiterhin als einfache Lernlösung
+  # für E-Mail-Benachrichtigungen verwendet.
+  #
+  SchachNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: "schach-analysis-results"
+
+
+  # 6. CodeCommit Repository & Pipeline
+  SchachRepository:
+    Type: AWS::CodeCommit::Repository
+
+    Properties:
+      RepositoryName: "schach-simulation-repo"
+
+
+  PipelineArtifactBucket:
+    Type: AWS::S3::Bucket
+
+    Properties:
+      BucketName: !Sub "schach-pipeline-artifacts-${AWS::AccountId}"
+
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+
+  CodePipelineServiceRole:
+    Type: AWS::IAM::Role
+
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+
+        Statement:
+          - Effect: Allow
+
+            Principal:
+              Service:
+                - codepipeline.amazonaws.com
+
+            Action:
+              - sts:AssumeRole
+
+
+      Policies:
+
+        - PolicyName: CodePipelineAccessPolicy
+
+          PolicyDocument:
+            Version: '2012-10-17'
+
+            Statement:
+
+              # Zugriff auf den Artifact Bucket
+              - Effect: Allow
+
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutObject
+                  - s3:PutObjectAcl
+                  - s3:GetBucketAcl
+                  - s3:GetBucketLocation
+
+                Resource:
+                  - !GetAtt PipelineArtifactBucket.Arn
+                  - !Sub "${PipelineArtifactBucket.Arn}/*"
+
+
+              # Zugriff auf den Website Bucket
+              - Effect: Allow
+
+                Action:
+                  - s3:PutObject
+                  - s3:PutObjectAcl
+                  - s3:PutObjectVersionAcl
+                  - s3:GetBucketVersioning
+                  - s3:GetBucketAcl
+                  - s3:GetBucketLocation
+
+                Resource:
+                  - !GetAtt WebsiteBucketV2.Arn
+                  - !Sub "${WebsiteBucketV2.Arn}/*"
+
+
+              # Zugriff auf CodeCommit
+              - Effect: Allow
+
+                Action:
+                  - codecommit:CancelUploadArchive
+                  - codecommit:GetBranch
+                  - codecommit:GetCommit
+                  - codecommit:GetUploadArchiveStatus
+                  - codecommit:UploadArchive
+                  - codecommit:GitPull
+
+                Resource: "*"
+
+
+
+  # 7. IAM Rolle für Upload-Lambda
+  UploadLambdaExecutionRole:
+    Type: AWS::IAM::Role
+
+    Properties:
+
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+
+        Statement:
+          - Effect: Allow
+
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+
+            Action:
+              - sts:AssumeRole
+
+
+      Policies:
+
+        - PolicyName: UploadLambdaPolicy
+
+          PolicyDocument:
+            Version: '2012-10-17'
+
+            Statement:
+
+              # Die Lambda darf lediglich Objekte
+              # im Upload-Bereich erzeugen.
+              - Effect: Allow
+
+                Action:
+                  - s3:PutObject
+
+                Resource:
+                  - !Sub "${SubmissionBucket.Arn}/uploads/*"
+
+
+              # CloudWatch Logs
+              - Effect: Allow
+
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+
+                Resource:
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*"
+
+
+
+  # 8. Upload-Lambda
+  #
+  # Die Website erhält keine AWS Credentials.
+  #
+  # Stattdessen fordert sie über API Gateway
+  # eine kurzlebige Presigned POST Policy an.
+  #
+  UploadLambda:
+    Type: AWS::Lambda::Function
+
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt UploadLambdaExecutionRole.Arn
+      Runtime: python3.11
+
+      Timeout: 10
+      MemorySize: 128
+
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref SubmissionBucket
+          MAX_UPLOAD_SIZE: "262144"
+
+      Code:
+        ZipFile: |
+
+          import json
+          import os
+          import re
+          import uuid
+
+          import boto3
+
+
+          s3 = boto3.client('s3')
+
+
+          BUCKET_NAME = os.environ['BUCKET_NAME']
+          MAX_UPLOAD_SIZE = int(
+              os.environ['MAX_UPLOAD_SIZE']
+          )
+
+
+          ALLOWED_EXTENSIONS = {
+              '.txt',
+              '.eml'
+          }
+
+
+          EMAIL_PATTERN = re.compile(
+              r'^[^@\s]+@[^@\s]+\.[^@\s]+$'
+          )
+
+
+          def response(status_code, body):
+
+              return {
+                  'statusCode': status_code,
+
+                  'headers': {
+                      'Content-Type': 'application/json',
+                      'Access-Control-Allow-Origin': '*',
+                      'Access-Control-Allow-Headers': 'Content-Type',
+                      'Access-Control-Allow-Methods': 'POST,OPTIONS'
+                  },
+
+                  'body': json.dumps(body)
+              }
+
+
+          def lambda_handler(event, context):
+
+              try:
+
+                  body = json.loads(
+                      event.get('body') or '{}'
+                  )
+
+              except json.JSONDecodeError:
+
+                  return response(
+                      400,
+                      {
+                          'error':
+                              'Ungültiger Request.'
+                      }
+                  )
+
+
+              email = str(
+                  body.get('email', '')
+              ).strip().lower()
+
+
+              filename = str(
+                  body.get('filename', '')
+              ).strip()
+
+
+              content_type = str(
+                  body.get('contentType', '')
+              ).strip().lower()
+
+
+              # E-Mail serverseitig prüfen
+              if (
+                  not email
+                  or len(email) > 254
+                  or not EMAIL_PATTERN.fullmatch(email)
+              ):
+
+                  return response(
+                      400,
+                      {
+                          'error':
+                              'Ungültige E-Mail-Adresse.'
+                      }
+                  )
+
+
+              # Nur den eigentlichen Dateinamen verwenden.
+              # Dadurch können keine Pfade eingeschleust werden.
+              filename = os.path.basename(filename)
+
+
+              if (
+                  not filename
+                  or len(filename) > 100
+              ):
+
+                  return response(
+                      400,
+                      {
+                          'error':
+                              'Ungültiger Dateiname.'
+                      }
+                  )
+
+
+              extension = os.path.splitext(
+                  filename.lower()
+              )[1]
+
+
+              if extension not in ALLOWED_EXTENSIONS:
+
+                  return response(
+                      400,
+                      {
+                          'error':
+                              'Nur .txt und .eml Dateien '
+                              'sind erlaubt.'
+                      }
+                  )
+
+
+              if not content_type:
+
+                  content_type = (
+                      'application/octet-stream'
+                  )
+
+
+              # Jeder Upload bekommt einen eigenen zufälligen Pfad.
+              #
+              # Der Benutzer kann dadurch keine bestehende Datei
+              # überschreiben.
+              object_key = (
+                  f"uploads/"
+                  f"{uuid.uuid4().hex}/"
+                  f"{filename}"
+              )
+
+
+              presigned_post = s3.generate_presigned_post(
+
+                  Bucket=BUCKET_NAME,
+
+                  Key=object_key,
+
+                  Fields={
+                      'Content-Type': content_type,
+                      'x-amz-meta-email': email
+                  },
+
+                  Conditions=[
+
+                      {
+                          'Content-Type': content_type
+                      },
+
+                      {
+                          'x-amz-meta-email': email
+                      },
+
+                      [
+                          'content-length-range',
+                          1,
+                          MAX_UPLOAD_SIZE
+                      ]
+                  ],
+
+                  ExpiresIn=300
+              )
+
+
+              return response(
+                  200,
+                  {
+                      'upload': presigned_post,
+                      'key': object_key
+                  }
+              )
+
+
+
+  # 9. IAM Rolle für Processor-Lambda
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+
+    Properties:
+
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+
+        Statement:
+          - Effect: Allow
+
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+
+            Action:
+              - sts:AssumeRole
+
+
+      Policies:
+
+        - PolicyName: LambdaDynamoAndSnsPolicy
+
+          PolicyDocument:
+            Version: '2012-10-17'
+
+            Statement:
+
+              # DynamoDB
+              - Effect: Allow
+
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+
+                Resource:
+                  - !GetAtt SchachSubmissionsTable.Arn
+
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                Resource:
+                  - !GetAtt SchachUsersTable.Arn
+
+
+              # SNS: Topic-Aktionen
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                  - sns:Subscribe
+                  - sns:ListSubscriptionsByTopic
+                Resource:
+                  - !Ref SchachNotificationTopic
+
+              # Filter-Policy auf Subscription-ARNs aktualisieren
+              - Effect: Allow
+                Action:
+                  - sns:SetSubscriptionAttributes
+                Resource:
+                  - !Sub "${SchachNotificationTopic}:*"
+
+
+              # Uploads lesen
+              - Effect: Allow
+
+                Action:
+                  - s3:GetObject
+
+                Resource:
+                  - !Sub "${SubmissionBucket.Arn}/uploads/*"
+
+
+              # Fehlerhafte Uploads löschen
+              - Effect: Allow
+
+                Action:
+                  - s3:DeleteObject
+
+                Resource:
+                  - !Sub "${SubmissionBucket.Arn}/uploads/*"
+
+
+              # SVG-Bretter veröffentlichen
+              - Effect: Allow
+
+                Action:
+                  - s3:PutObject
+
+                Resource:
+                  - !Sub "${WebsiteBucketV2.Arn}/boards/*"
+
+
+              # CloudWatch Logs
+              - Effect: Allow
+
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+
+                Resource:
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*"
+
+
+
+  # 10. Upload-Processor-Lambda
+  #
+  # Wird von S3 aufgerufen.
+  #
+  # Die Lambda validiert die Datei erneut.
+  # Die Prüfung im Browser bzw. in der Upload-Lambda
+  # ist NICHT die eigentliche Sicherheitsgrenze.
+  #
+  SchachProcessorLambda:
+    Type: AWS::Lambda::Function
+
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.11
+
+      Timeout: 30
+      MemorySize: 256
+
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref SchachSubmissionsTable
+          USERS_TABLE_NAME: !Ref SchachUsersTable
+          SNS_TOPIC_ARN: !Ref SchachNotificationTopic
+          BUCKET_NAME: !Ref SubmissionBucket
+
+          API_BASE_URL:
+            !Sub
+              - "https://${ApiId}.execute-api.${AWS::Region}.amazonaws.com/prod"
+              - ApiId: !Ref SchachApi
+
+      Code:
+        ZipFile: |
+
+          import json
+          import os
+          import time
+          import uuid
+          from email import policy
+          from email.parser import BytesParser
+
+          import boto3
+          from botocore.exceptions import ClientError
+
+
+          s3 = boto3.client('s3')
+          dynamodb = boto3.resource('dynamodb')
+          sns = boto3.client('sns')
+
+
+          TABLE_NAME = os.environ['TABLE_NAME']
+          USERS_TABLE_NAME = os.environ['USERS_TABLE_NAME']
+          SNS_TOPIC_ARN = os.environ['SNS_TOPIC_ARN']
+          BUCKET_NAME = os.environ['BUCKET_NAME']
+          API_BASE_URL = os.environ['API_BASE_URL']
+
+
+          table = dynamodb.Table(TABLE_NAME)
+          users_table = dynamodb.Table(USERS_TABLE_NAME)
+
+
+          MAX_FILE_SIZE = 262144
+
+
+          ALLOWED_EXTENSIONS = (
+              '.txt',
+              '.eml'
+          )
+
+
+          ALLOWED_CONTENT_TYPES = {
+              'text/plain',
+              'message/rfc822',
+              'application/octet-stream'
+          }
+
+
+          def get_or_create_user(email):
+              """Return a stable UserId for a normalized email address."""
+              result = users_table.get_item(Key={'Email': email}, ConsistentRead=True)
+              existing = result.get('Item')
+              if existing and existing.get('UserId'):
+                  return existing['UserId']
+
+              candidate_user_id = str(uuid.uuid4())
+              try:
+                  users_table.put_item(
+                      Item={
+                          'Email': email,
+                          'UserId': candidate_user_id,
+                          'CreatedAt': int(time.time())
+                      },
+                      ConditionExpression='attribute_not_exists(Email)'
+                  )
+                  print(f"Neue UserId erstellt für {email}")
+                  return candidate_user_id
+              except ClientError as error:
+                  if error.response.get('Error', {}).get('Code') != 'ConditionalCheckFailedException':
+                      raise
+                  # Ein paralleler Upload hat den Nutzer zuerst angelegt.
+                  result = users_table.get_item(Key={'Email': email}, ConsistentRead=True)
+                  existing = result.get('Item')
+                  if not existing or not existing.get('UserId'):
+                      raise RuntimeError('Nutzerzuordnung konnte nach Konflikt nicht geladen werden')
+                  return existing['UserId']
+
+
+          def find_email_subscription(email):
+              """Find a confirmed or pending email subscription for this endpoint."""
+              token = None
+              while True:
+                  args = {'TopicArn': SNS_TOPIC_ARN}
+                  if token:
+                      args['NextToken'] = token
+                  page = sns.list_subscriptions_by_topic(**args)
+                  for sub in page.get('Subscriptions', []):
+                      if sub.get('Protocol') == 'email' and sub.get('Endpoint', '').lower() == email.lower():
+                          return sub
+                  token = page.get('NextToken')
+                  if not token:
+                      return None
+
+
+          def set_user_filter(subscription_arn, user_id):
+              sns.set_subscription_attributes(
+                  SubscriptionArn=subscription_arn,
+                  AttributeName='FilterPolicy',
+                  AttributeValue=json.dumps({'userId': [user_id]})
+              )
+              sns.set_subscription_attributes(
+                  SubscriptionArn=subscription_arn,
+                  AttributeName='FilterPolicyScope',
+                  AttributeValue='MessageAttributes'
+              )
+
+
+          def lambda_handler(event, context):
+
+              for record in event.get('Records', []):
+
+                  bucket = record['s3']['bucket']['name']
+
+                  key = record['s3']['object']['key']
+
+
+                  print(
+                      f"Verarbeite Upload: "
+                      f"{bucket}/{key}"
+                  )
+
+
+                  # Nur Uploads dürfen diesen Trigger
+                  # sinnvoll auslösen.
+                  if not key.startswith('uploads/'):
+
+                      continue
+
+
+                  # Dateiendung prüfen
+                  if not key.lower().endswith(
+                      ALLOWED_EXTENSIONS
+                  ):
+
+                      print(
+                          f"Nicht erlaubte Dateiendung: {key}"
+                      )
+
+                      s3.delete_object(
+                          Bucket=bucket,
+                          Key=key
+                      )
+
+                      continue
+
+
+                  try:
+
+                      head = s3.head_object(
+                          Bucket=bucket,
+                          Key=key
+                      )
+
+                  except Exception as error:
+
+                      print(
+                          f"HEAD Object fehlgeschlagen: "
+                          f"{error}"
+                      )
+
+                      continue
+
+
+                  file_size = head.get(
+                      'ContentLength',
+                      0
+                  )
+
+
+                  metadata = head.get(
+                      'Metadata',
+                      {}
+                  )
+
+
+                  email = metadata.get(
+                      'email',
+                      ''
+                  ).strip().lower()
+
+
+                  # Größenprüfung erneut serverseitig
+                  if (
+                      file_size <= 0
+                      or file_size > MAX_FILE_SIZE
+                  ):
+
+                      print(
+                          f"Datei wegen Größe abgelehnt: "
+                          f"{key}"
+                      )
+
+                      s3.delete_object(
+                          Bucket=bucket,
+                          Key=key
+                      )
+
+                      continue
+
+
+                  if not email:
+
+                      print(
+                          f"Keine E-Mail-Adresse für {key}"
+                      )
+
+                      s3.delete_object(
+                          Bucket=bucket,
+                          Key=key
+                      )
+
+                      continue
+
+
+                  content_type = head.get(
+                      'ContentType',
+                      ''
+                  ).lower()
+
+
+                  if content_type not in ALLOWED_CONTENT_TYPES:
+
+                      print(
+                          f"Nicht erlaubter Content-Type: "
+                          f"{content_type}"
+                      )
+
+                      s3.delete_object(
+                          Bucket=bucket,
+                          Key=key
+                      )
+
+                      continue
+
+
+                  # Datei nur bis zum erlaubten Maximum lesen.
+                  try:
+
+                      obj = s3.get_object(
+                          Bucket=bucket,
+                          Key=key
+                      )
+
+                      content = obj['Body'].read(
+                          MAX_FILE_SIZE + 1
+                      )
+
+                  except Exception as error:
+
+                      print(
+                          f"Datei konnte nicht gelesen werden: "
+                          f"{error}"
+                      )
+
+                      continue
+
+
+                  if len(content) > MAX_FILE_SIZE:
+
+                      s3.delete_object(
+                          Bucket=bucket,
+                          Key=key
+                      )
+
+                      continue
+
+
+                  # .txt-Dateien enthalten direkt die Zugliste.
+                  # .eml-Dateien werden zuerst als E-Mail geparst, damit
+                  # Header wie From/Subject nicht als Schachzüge gewertet werden.
+                  try:
+                      if key.lower().endswith('.eml'):
+                          message = BytesParser(policy=policy.default).parsebytes(content)
+                          body_part = message.get_body(preferencelist=('plain',))
+                          if body_part is None:
+                              print(f"Keine text/plain-Nutzlast in E-Mail-Datei: {key}")
+                              s3.delete_object(Bucket=bucket, Key=key)
+                              continue
+                          text = body_part.get_content()
+                          if not isinstance(text, str):
+                              raise ValueError('E-Mail-Text konnte nicht dekodiert werden')
+                      else:
+                          text = content.decode('utf-8-sig')
+                  except (UnicodeDecodeError, ValueError, LookupError) as error:
+                      print(f"Dateiinhalt konnte nicht dekodiert/geparst werden: {key}: {error}")
+                      s3.delete_object(Bucket=bucket, Key=key)
+                      continue
+                  except Exception as error:
+                      print(f"E-Mail-Datei konnte nicht geparst werden: {key}: {error}")
+                      s3.delete_object(Bucket=bucket, Key=key)
+                      continue
+
+                  moves = text.split()
+
+
+                  if len(moves) == 0:
+
+                      s3.delete_object(
+                          Bucket=bucket,
+                          Key=key
+                      )
+
+                      continue
+
+
+                  # Schutz gegen extrem viele Züge
+                  if len(moves) > 5000:
+
+                      s3.delete_object(
+                          Bucket=bucket,
+                          Key=key
+                      )
+
+                      continue
+
+
+                  valid_moves = True
+
+
+                  for move in moves:
+
+                      if (
+                          len(move) != 2
+                          or move[0].lower()
+                          not in 'abcdefgh'
+                          or move[1]
+                          not in '12345678'
+                      ):
+
+                          valid_moves = False
+                          break
+
+
+                  if not valid_moves:
+
+                      print(
+                          f"Ungültiges Zugformat: {key}"
+                      )
+
+                      s3.delete_object(
+                          Bucket=bucket,
+                          Key=key
+                      )
+
+                      continue
+
+
+                  # Stabile Nutzeridentität (unabhängig vom Submission-Token).
+                  try:
+                      user_id = get_or_create_user(email)
+                  except Exception as error:
+                      print(f"Nutzerzuordnung fehlgeschlagen für {email}: {error}")
+                      # Ohne stabile Zuordnung darf keine Submission angelegt werden.
+                      continue
+
+
+                  # Jede Einreichung behält ihren eigenen Token.
+                  token = str(uuid.uuid4())
+                  expires_at = int(time.time()) + 86400
+
+                  table.put_item(
+                      Item={
+                          'Token': token,
+                          'UserId': user_id,
+                          'Email': email,
+                          'FileKey': key,
+                          'Status': 'PENDING',
+                          'Used': False,
+                          'ExpiresAt': expires_at
+                      }
+                  )
+
+                  confirmation_link = f"{API_BASE_URL}/confirm?token={token}"
+
+                  # Eine Subscription pro E-Mail-Adresse wiederverwenden.
+                  # Neue E-Mail-Subscriptions benötigen zuerst eine Bestätigung.
+                  subscription_ready = False
+                  try:
+                      subscription = find_email_subscription(email)
+                      if subscription is None:
+                          created = sns.subscribe(
+                              TopicArn=SNS_TOPIC_ARN,
+                              Protocol='email',
+                              Endpoint=email,
+                              Attributes={
+                                  'FilterPolicy': json.dumps({'userId': [user_id]}),
+                                  'FilterPolicyScope': 'MessageAttributes'
+                              }
+                          )
+                          subscription_arn = created.get('SubscriptionArn')
+                          if subscription_arn and subscription_arn.lower() not in {'pending confirmation', 'pendingconfirmation'}:
+                              set_user_filter(subscription_arn, user_id)
+                              subscription_ready = True
+                          else:
+                              print(
+                                  f"SNS-Subscription für {email} ist neu und muss erst bestätigt werden. "
+                                  'Der Anwendungs-Bestätigungslink wird bei einem späteren erneuten Versand zugestellt.'
+                              )
+                      else:
+                          subscription_arn = subscription.get('SubscriptionArn')
+                          if subscription_arn and subscription_arn.lower() not in {'pending confirmation', 'pendingconfirmation'}:
+                              set_user_filter(subscription_arn, user_id)
+                              subscription_ready = True
+                              users_table.update_item(
+                                  Key={'Email': email},
+                                  UpdateExpression='SET SubscriptionArn = :arn',
+                                  ExpressionAttributeValues={':arn': subscription_arn}
+                              )
+                          else:
+                              print(
+                                  f"SNS-Subscription für {email} wartet noch auf Bestätigung; "
+                                  'Anwendungslink wurde nicht veröffentlicht.'
+                              )
+                  except Exception as error:
+                      print(f"SNS Subscription/Filter Fehler für {email}: {error}")
+
+                  # Nur an eine bestätigte Subscription publizieren, damit neue
+                  # Nutzer-Nachrichten nicht still an PendingConfirmation verloren gehen.
+                  if subscription_ready:
+                      try:
+                          publish_result = sns.publish(
+                              TopicArn=SNS_TOPIC_ARN,
+                              Subject='Bestätigung deiner Schach-Einreichung',
+                              Message=(
+                                  'Hallo!\n\n'
+                                  'Vielen Dank für deine Schach-Einreichung.\n\n'
+                                  'Bitte klicke auf den folgenden Link, um diese Einreichung zu bestätigen und die Analyse zu starten:\n\n'
+                                  f'{confirmation_link}\n\n'
+                                  'Vielen Dank!'
+                              ),
+                              MessageAttributes={
+                                  'userId': {
+                                      'DataType': 'String',
+                                      'StringValue': user_id
+                                  }
+                              }
+                          )
+                          print(
+                              f"SNS-Nachricht für UserId {user_id} veröffentlicht; "
+                              f"MessageId={publish_result.get('MessageId')}"
+                          )
+                      except Exception as error:
+                          print(f"SNS Publish Fehler für UserId {user_id}: {error}")
+
+
+              return {
+                  'statusCode': 200,
+                  'body': 'OK'
+              }
+
+
+
+  # 11. S3 Berechtigung für Processor Lambda
+  LambdaS3InvokePermission:
+    Type: AWS::Lambda::Permission
+
+    Properties:
+      Action: lambda:InvokeFunction
+
+      FunctionName:
+        !Ref SchachProcessorLambda
+
+      Principal:
+        s3.amazonaws.com
+
+      SourceAccount:
+        !Ref AWS::AccountId
+
+      SourceArn:
+        !GetAtt SubmissionBucket.Arn
+
+
+  # 12. Custom Resource für S3 Event Notification
+  #
+  # CloudFormation besitzt keinen eigenen Resource-Typ,
+  # mit dem man eine bestehende S3 Bucket Notification
+  # unabhängig vom Bucket definieren kann.
+  #
+  # Deshalb übernimmt eine kleine Lambda diese Aufgabe.
+  #
+  S3NotificationCustomResourceRole:
+    Type: AWS::IAM::Role
+
+    Properties:
+
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+
+        Statement:
+          - Effect: Allow
+
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+
+            Action:
+              - sts:AssumeRole
+
+
+      Policies:
+
+        - PolicyName: S3NotificationConfigurationPolicy
+
+          PolicyDocument:
+            Version: '2012-10-17'
+
+            Statement:
+
+              - Effect: Allow
+
+                Action:
+                  - s3:GetBucketNotification
+                  - s3:PutBucketNotification
+
+                Resource:
+                  - !GetAtt SubmissionBucket.Arn
+
+
+              - Effect: Allow
+
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+
+                Resource:
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*"
+
+
+
+  S3NotificationCustomResourceLambda:
+    Type: AWS::Lambda::Function
+
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt S3NotificationCustomResourceRole.Arn
+      Runtime: python3.11
+
+      Timeout: 30
+      MemorySize: 128
+
+      Code:
+        ZipFile: |
+
+          import boto3
+          import cfnresponse
+
+
+          s3 = boto3.client('s3')
+
+
+          NOTIFICATION_ID = (
+              'SchachProcessorUploadNotification'
+          )
+
+
+          def send_response(
+              event,
+              context,
+              status,
+              data=None
+          ):
+
+              cfnresponse.send(
+                  event,
+                  context,
+                  status,
+                  data or {},
+                  NOTIFICATION_ID
+              )
+
+
+          def lambda_handler(event, context):
+
+              try:
+
+                  bucket = (
+                      event['ResourceProperties']
+                      ['BucketName']
+                  )
+
+                  function_arn = (
+                      event['ResourceProperties']
+                      ['FunctionArn']
+                  )
+
+
+                  request_type = (
+                      event['RequestType']
+                  )
+
+
+                  # Aktuelle Notification-Konfiguration lesen.
+                  #
+                  # Das ist wichtig, weil PutBucketNotificationConfiguration
+                  # die komplette Konfiguration ersetzt.
+                  current = (
+                      s3.get_bucket_notification_configuration(
+                          Bucket=bucket
+                      )
+                  )
+
+
+                  # ResponseMetadata gehört nicht in die
+                  # PutBucketNotificationConfiguration-Anfrage.
+                  current.pop(
+                      'ResponseMetadata',
+                      None
+                  )
+
+
+                  lambda_configurations = (
+                      current.get(
+                          'LambdaFunctionConfigurations',
+                          []
+                      )
+                  )
+
+
+                  # Unsere eigene Konfiguration entfernen.
+                  #
+                  # Dadurch ist die Funktion idempotent und kann
+                  # auch bei einem Update erneut ausgeführt werden.
+                  lambda_configurations = [
+
+                      configuration
+
+                      for configuration
+                      in lambda_configurations
+
+                      if configuration.get('Id')
+                      != NOTIFICATION_ID
+                  ]
+
+
+                  if request_type != 'Delete':
+
+                      lambda_configurations.append(
+
+                          {
+                              'Id':
+                                  NOTIFICATION_ID,
+
+                              'LambdaFunctionArn':
+                                  function_arn,
+
+                              'Events':
+                                  [
+                                      's3:ObjectCreated:*'
+                                  ],
+
+                              'Filter': {
+                                  'Key': {
+                                      'FilterRules': [
+                                          {
+                                              'Name': 'prefix',
+                                              'Value': 'uploads/'
+                                          }
+                                      ]
+                                  }
+                              }
+                          }
+                      )
+
+
+                  if lambda_configurations:
+
+                      current[
+                          'LambdaFunctionConfigurations'
+                      ] = lambda_configurations
+
+                  else:
+
+                      current.pop(
+                          'LambdaFunctionConfigurations',
+                          None
+                      )
+
+
+                  # Neue Konfiguration atomar speichern.
+                  s3.put_bucket_notification_configuration(
+
+                      Bucket=bucket,
+
+                      NotificationConfiguration=current
+                  )
+
+
+                  send_response(
+                      event,
+                      context,
+                      cfnresponse.SUCCESS,
+                      {
+                          'NotificationId':
+                              NOTIFICATION_ID
+                      }
+                  )
+
+
+              except Exception as error:
+
+                  print(
+                      f"Custom Resource Fehler: {error}"
+                  )
+
+
+                  send_response(
+                      event,
+                      context,
+                      cfnresponse.FAILED,
+                      {
+                          'Error':
+                              str(error)
+                      }
+                  )
+
+
+
+  # 13. S3 Notification Custom Resource
+  #
+  # Die Abhängigkeiten sind hier bewusst explizit.
+  #
+  # Erst müssen Bucket, Lambda und Invoke Permission
+  # existieren.
+  #
+  # Danach wird die S3 Notification eingerichtet.
+  #
+  SubmissionBucketNotification:
+    Type: Custom::S3BucketNotification
+
+    DependsOn:
+      - LambdaS3InvokePermission
+
+    Properties:
+      ServiceToken:
+        !GetAtt S3NotificationCustomResourceLambda.Arn
+
+      BucketName:
+        !Ref SubmissionBucket
+
+      FunctionArn:
+        !GetAtt SchachProcessorLambda.Arn
+
+
+
+  # 14. IAM Rolle für das Bestätigungs- & Analyse-Lambda
+  ConfirmLambdaExecutionRole:
+    Type: AWS::IAM::Role
+
+    Properties:
+
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+
+        Statement:
+          - Effect: Allow
+
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+
+            Action:
+              - sts:AssumeRole
+
+
+      Policies:
+
+        - PolicyName: ConfirmLambdaPolicy
+
+          PolicyDocument:
+            Version: '2012-10-17'
+
+            Statement:
+
+              # DynamoDB
+              - Effect: Allow
+
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+
+                Resource:
+                  - !GetAtt SchachSubmissionsTable.Arn
+
+
+              # Hochgeladene Datei lesen
+              - Effect: Allow
+
+                Action:
+                  - s3:GetObject
+
+                Resource:
+                  - !Sub "${SubmissionBucket.Arn}/uploads/*"
+
+
+              # SVG Ergebnis schreiben
+              - Effect: Allow
+
+                Action:
+                  - s3:PutObject
+
+                Resource:
+                  - !Sub "${WebsiteBucketV2.Arn}/boards/*"
+
+
+              # SNS Ergebnis versenden
+              - Effect: Allow
+
+                Action:
+                  - sns:Publish
+
+                Resource:
+                  - !Ref SchachNotificationTopic
+
+
+              # CloudWatch Logs
+              - Effect: Allow
+
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+
+                Resource:
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*"
+
+
+
+  # 15. Confirm & Analyse Lambda
+  SchachConfirmLambda:
+    Type: AWS::Lambda::Function
+
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt ConfirmLambdaExecutionRole.Arn
+      Runtime: python3.11
+
+      Timeout: 30
+      MemorySize: 256
+
+      Environment:
+        Variables:
+          TABLE_NAME:
+            !Ref SchachSubmissionsTable
+
+          SNS_TOPIC_ARN:
+            !Ref SchachNotificationTopic
+
+          BUCKET_NAME:
+            !Ref SubmissionBucket
+
+          WEBSITE_BUCKET_NAME:
+            !Ref WebsiteBucketV2
+
+      Code:
+        ZipFile: |
+
+          import os
+
+          import boto3
+
+          from botocore.exceptions import ClientError
+          from email import policy
+          from email.parser import BytesParser
+
+
+          dynamodb = boto3.resource('dynamodb')
+          s3 = boto3.client('s3')
+          sns = boto3.client('sns')
+
+
+          TABLE_NAME = os.environ['TABLE_NAME']
+          SNS_TOPIC_ARN = os.environ['SNS_TOPIC_ARN']
+          BUCKET_NAME = os.environ['BUCKET_NAME']
+          WEBSITE_BUCKET_NAME = (
+              os.environ['WEBSITE_BUCKET_NAME']
+          )
+
+
+          table = dynamodb.Table(TABLE_NAME)
+
+
+          PIECE_SYMBOLS = {
+              'P': '♙',
+              'N': '♘',
+              'B': '♗',
+              'R': '♖',
+              'Q': '♕',
+              'K': '♔',
+              'p': '♟',
+              'n': '♞',
+              'b': '♝',
+              'r': '♜',
+              'q': '♛',
+              'k': '♚'
+          }
+
+
+          def parse_square(sq):
+
+              col = (
+                  ord(sq[0].lower())
+                  - ord('a')
+              )
+
+              row = 8 - int(sq[1])
+
+              return row, col
+
+
+          def simulate_game(moves_flat):
+
+              board = [
+                  ['r', 'n', 'b', 'q', 'k', 'b', 'n', 'r'],
+                  ['p', 'p', 'p', 'p', 'p', 'p', 'p', 'p'],
+                  ['', '', '', '', '', '', '', ''],
+                  ['', '', '', '', '', '', '', ''],
+                  ['', '', '', '', '', '', '', ''],
+                  ['', '', '', '', '', '', '', ''],
+                  ['P', 'P', 'P', 'P', 'P', 'P', 'P', 'P'],
+                  ['R', 'N', 'B', 'Q', 'K', 'B', 'N', 'R']
+              ]
+
+
+              move_pairs = []
+
+
+              for i in range(
+                  0,
+                  len(moves_flat) - 1,
+                  2
+              ):
+
+                  move_pairs.append(
+                      (
+                          moves_flat[i],
+                          moves_flat[i + 1]
+                      )
+                  )
+
+
+              for from_sq, to_sq in move_pairs:
+
+                  try:
+
+                      fr, fc = parse_square(from_sq)
+                      tr, tc = parse_square(to_sq)
+
+                      piece = board[fr][fc]
+
+                      if not piece:
+                          continue
+
+                      board[tr][tc] = piece
+                      board[fr][fc] = ''
+
+                  except Exception:
+
+                      pass
+
+
+              return board, move_pairs
+
+
+          def generate_board_svg(board):
+
+              svg = (
+                  '<svg '
+                  'xmlns="http://www.w3.org/2000/svg" '
+                  'width="400" '
+                  'height="400" '
+                  'viewBox="0 0 400 400">'
+              )
+
+
+              for row in range(8):
+
+                  for col in range(8):
+
+                      color = (
+                          "#f0d9b5"
+                          if (row + col) % 2 == 0
+                          else "#b58863"
+                      )
+
+                      svg += (
+                          f'<rect '
+                          f'x="{col * 50}" '
+                          f'y="{row * 50}" '
+                          f'width="50" '
+                          f'height="50" '
+                          f'fill="{color}"/>'
+                      )
+
+
+              for row in range(8):
+
+                  for col in range(8):
+
+                      piece = board[row][col]
+
+                      if piece in PIECE_SYMBOLS:
+
+                          symbol = PIECE_SYMBOLS[piece]
+
+                          svg += (
+                              f'<text '
+                              f'x="{col * 50 + 25}" '
+                              f'y="{row * 50 + 35}" '
+                              f'font-size="32" '
+                              f'text-anchor="middle">'
+                              f'{symbol}'
+                              f'</text>'
+                          )
+
+
+              svg += '</svg>'
+
+              return svg
+
+
+          def lambda_handler(event, context):
+
+              params = (
+                  event.get(
+                      'queryStringParameters'
+                  ) or {}
+              )
+
+
+              token = params.get('token')
+
+
+              if not token:
+
+                  return {
+                      'statusCode': 400,
+
+                      'headers': {
+                          'Content-Type':
+                              'text/html; charset=utf-8'
+                      },
+
+                      'body':
+                          '<h3>Fehler: '
+                          'Kein Bestätigungstoken '
+                          'angegeben.</h3>'
+                  }
+
+
+              try:
+
+                  response = table.update_item(
+
+                      Key={
+                          'Token': token
+                      },
+
+                      UpdateExpression=
+                          'SET #status = :proc, '
+                          '#used = :val',
+
+                      ConditionExpression=
+                          'attribute_exists(#tokenKey) '
+                          'AND #used = :falseVal',
+
+                      ExpressionAttributeNames={
+                          '#status': 'Status',
+                          '#used': 'Used',
+                          '#tokenKey': 'Token'
+                      },
+
+                      ExpressionAttributeValues={
+                          ':proc': 'PROCESSING',
+                          ':val': True,
+                          ':falseVal': False
+                      },
+
+                      ReturnValues='ALL_NEW'
+                  )
+
+
+                  item = response['Attributes']
+
+                  email = item['Email']
+                  file_key = item['FileKey']
+                  user_id = item.get('UserId')
+
+
+              except ClientError as error:
+
+                  if (
+                      error.response['Error']['Code']
+                      == 'ConditionalCheckFailedException'
+                  ):
+
+                      return {
+                          'statusCode': 400,
+
+                          'headers': {
+                              'Content-Type':
+                                  'text/html; charset=utf-8'
+                          },
+
+                          'body':
+                              '<h2 style="color: red;">'
+                              'Fehler</h2>'
+                              '<p>Der Bestätigungslink '
+                              'ist ungültig oder wurde '
+                              'bereits verwendet!</p>'
+                      }
+
+                  raise
+
+
+              analysis_result = (
+                  'Unbekannter Fehler bei der Analyse.'
+              )
+
+
+              try:
+
+                  obj = s3.get_object(
+                      Bucket=BUCKET_NAME,
+                      Key=file_key
+                  )
+
+
+                  raw_content = obj['Body'].read(
+                      262145
+                  )
+
+
+                  if len(raw_content) > 262144:
+
+                      raise ValueError(
+                          'Die Datei ist zu groß.'
+                      )
+
+
+                  # .eml-Dateien als E-Mail parsen; Header nicht als Züge werten.
+                  if file_key.lower().endswith('.eml'):
+
+                      message = BytesParser(
+                          policy=policy.default
+                      ).parsebytes(raw_content)
+
+                      body_part = message.get_body(
+                          preferencelist=('plain',)
+                      )
+
+                      if body_part is None:
+
+                          raise ValueError(
+                              'Keine text/plain-Nutzlast in E-Mail-Datei.'
+                          )
+
+                      content = body_part.get_content()
+
+                      if not isinstance(content, str):
+
+                          raise ValueError(
+                              'E-Mail-Text konnte nicht dekodiert werden.'
+                          )
+
+                  else:
+
+                      content = raw_content.decode(
+                          'utf-8-sig'
+                      )
+
+
+                  content = content.strip()
+                  moves = content.split()
+
+
+                  if len(moves) == 0:
+
+                      raise ValueError(
+                          'Die Datei enthält keine Züge.'
+                      )
+
+
+                  if len(moves) > 5000:
+
+                      raise ValueError(
+                          'Die Datei enthält zu viele Züge.'
+                      )
+
+
+                  for move in moves:
+
+                      if (
+                          len(move) != 2
+                          or move[0].lower()
+                          not in 'abcdefgh'
+                          or move[1]
+                          not in '12345678'
+                      ):
+
+                          raise ValueError(
+                              f'Ungültiger Zug: {move}'
+                          )
+
+
+                  board, move_pairs = (
+                      simulate_game(moves)
+                  )
+
+
+                  move_count = len(move_pairs)
+
+
+                  game_status = (
+                      'Partie beendet / Verlauf intakt.'
+                  )
+
+
+                  if (
+                      move_count == 4
+                      and move_pairs[-1]
+                      == ('d8', 'h4')
+                  ):
+
+                      game_status = (
+                          'SCHWARZ gewinnt durch '
+                          'Schachmatt '
+                          '(Narrenmatt / Fool’s Mate)!'
+                      )
+
+                  else:
+
+                      white_king_alive = any(
+                          'K' in row
+                          for row in board
+                      )
+
+                      black_king_alive = any(
+                          'k' in row
+                          for row in board
+                      )
+
+
+                      if not white_king_alive:
+
+                          game_status = (
+                              'SCHWARZ gewinnt '
+                              '(Weißer König geschlagen)!'
+                          )
+
+                      elif not black_king_alive:
+
+                          game_status = (
+                              'WEISS gewinnt '
+                              '(Schwarzer König geschlagen)!'
+                          )
+
+
+                  svg_content = generate_board_svg(
+                      board
+                  )
+
+
+                  board_key = (
+                      f'boards/{token}.svg'
+                  )
+
+
+                  s3.put_object(
+
+                      Bucket=WEBSITE_BUCKET_NAME,
+
+                      Key=board_key,
+
+                      Body=svg_content.encode(
+                          'utf-8'
+                      ),
+
+                      ContentType='image/svg+xml',
+
+                      CacheControl='no-cache'
+                  )
+
+
+                  board_url = (
+                      f"https://"
+                      f"{WEBSITE_BUCKET_NAME}"
+                      f".s3.amazonaws.com/"
+                      f"{board_key}"
+                  )
+
+
+                  analysis_result = (
+
+                      'ERFOLGREICH ANALYSIERT!\n'
+
+                      '----------------------------------------\n'
+
+                      f'Datei: {file_key}\n'
+
+                      f'Gespielte Halbzüge: '
+                      f'{len(moves)}\n'
+
+                      f'Ergebnis / Status: '
+                      f'{game_status}\n'
+
+                      f'Grafische Brett-Ansicht: '
+                      f'{board_url}\n'
+
+                      '----------------------------------------'
+                  )
+
+
+                  table.update_item(
+
+                      Key={
+                          'Token': token
+                      },
+
+                      UpdateExpression=
+                          'SET #status = :st',
+
+                      ExpressionAttributeNames={
+                          '#status': 'Status'
+                      },
+
+                      ExpressionAttributeValues={
+                          ':st': 'COMPLETED'
+                      }
+                  )
+
+
+              except Exception as error:
+
+                  print(
+                      f'FEHLER beim Verarbeiten: '
+                      f'{error}'
+                  )
+
+
+                  analysis_result = (
+                      'FEHLER beim Verarbeiten '
+                      'der Datei.'
+                  )
+
+
+                  table.update_item(
+
+                      Key={
+                          'Token': token
+                      },
+
+                      UpdateExpression=
+                          'SET #status = :st',
+
+                      ExpressionAttributeNames={
+                          '#status': 'Status'
+                      },
+
+                      ExpressionAttributeValues={
+                          ':st': 'FAILED'
+                      }
+                  )
+
+
+              try:
+
+                  # Nur die passende Submission erhalten.
+                  #
+                  # Der Token wird als Message Attribute verwendet.
+                  sns.publish(
+
+                      TopicArn=SNS_TOPIC_ARN,
+
+                      Subject=
+                          'Schach-Analyseergebnis '
+                          'deiner Einreichung',
+
+                      Message=
+                          f'Hallo,\n\n'
+                          f'hier ist das Ergebnis '
+                          f'deiner Schach-Analyse:\n\n'
+                          f'{analysis_result}\n\n'
+                          f'Vielen Dank für die Teilnahme!',
+
+                      MessageAttributes={
+                          # User-Abonnement filtert nach userId.
+                          'userId': {
+                              'DataType': 'String',
+                              'StringValue': user_id
+                          },
+                          # Token bleibt für die eindeutige Einreichung enthalten.
+                          'submission': {
+                              'DataType': 'String',
+                              'StringValue': token
+                          }
+                      }
+                  )
+
+              except Exception as error:
+
+                  print(
+                      f'SNS Publish Fehler: '
+                      f'{error}'
+                  )
+
+
+              return {
+
+                  'statusCode': 200,
+
+                  'headers': {
+                      'Content-Type':
+                          'text/html; charset=utf-8'
+                  },
+
+                  'body':
+                      '<h2 style="color: green;">'
+                      'Erfolgreich bestätigt!</h2>'
+
+                      '<p>Deine Schach-Einreichung '
+                      'wurde analysiert. Das Ergebnis '
+                      'wurde per E-Mail zugeschickt.</p>'
+              }
+
+
+
+  # 16. API Gateway
+  SchachApi:
+    Type: AWS::ApiGateway::RestApi
+
+    Properties:
+      Name: schach-api
+
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+
+
+
+  # 17. API Resource /upload
+  ApiResourceUpload:
+    Type: AWS::ApiGateway::Resource
+
+    Properties:
+      RestApiId:
+        !Ref SchachApi
+
+      ParentId:
+        !GetAtt SchachApi.RootResourceId
+
+      PathPart:
+        upload
+
+
+
+  # 18. API Method POST /upload
+  ApiMethodUpload:
+    Type: AWS::ApiGateway::Method
+
+    Properties:
+      RestApiId:
+        !Ref SchachApi
+
+      ResourceId:
+        !Ref ApiResourceUpload
+
+      HttpMethod:
+        POST
+
+      AuthorizationType:
+        NONE
+
+      Integration:
+        Type:
+          AWS_PROXY
+
+        IntegrationHttpMethod:
+          POST
+
+        Uri:
+          !Sub
+            - "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaArn}/invocations"
+            - LambdaArn:
+                !GetAtt UploadLambda.Arn
+
+
+
+  # 19. API Method OPTIONS /upload (CORS Preflight)
+  ApiMethodUploadOptions:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref SchachApi
+      ResourceId: !Ref ApiResourceUpload
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      ApiKeyRequired: false
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: '200'
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: !Sub "'https://${WebsiteBucketV2}.s3.${AWS::Region}.amazonaws.com'"
+              method.response.header.Access-Control-Allow-Methods: "'OPTIONS,POST'"
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type'"
+            ResponseTemplates:
+              application/json: ''
+      MethodResponses:
+        - StatusCode: '200'
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Headers: true
+
+
+  # 20. API Permission für Upload-Lambda
+  UploadLambdaApiPermission:
+    Type: AWS::Lambda::Permission
+
+    Properties:
+      Action:
+        lambda:InvokeFunction
+
+      FunctionName:
+        !Ref UploadLambda
+
+      Principal:
+        apigateway.amazonaws.com
+
+      SourceArn:
+        !Sub
+          "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${SchachApi}/*/POST/upload"
+
+
+
+  # 20. API Resource /confirm
+  ApiResourceConfirm:
+    Type: AWS::ApiGateway::Resource
+
+    Properties:
+      RestApiId:
+        !Ref SchachApi
+
+      ParentId:
+        !GetAtt SchachApi.RootResourceId
+
+      PathPart:
+        confirm
+
+
+
+  # 21. API Method GET /confirm
+  ApiMethodConfirmGet:
+    Type: AWS::ApiGateway::Method
+
+    Properties:
+      RestApiId:
+        !Ref SchachApi
+
+      ResourceId:
+        !Ref ApiResourceConfirm
+
+      HttpMethod:
+        GET
+
+      AuthorizationType:
+        NONE
+
+      Integration:
+        Type:
+          AWS_PROXY
+
+        IntegrationHttpMethod:
+          POST
+
+        Uri:
+          !Sub
+            - "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaArn}/invocations"
+            - LambdaArn:
+                !GetAtt SchachConfirmLambda.Arn
+
+
+
+  # 22. API Permission für Confirm-Lambda
+  ApiLambdaPermission:
+    Type: AWS::Lambda::Permission
+
+    Properties:
+      Action:
+        lambda:InvokeFunction
+
+      FunctionName:
+        !Ref SchachConfirmLambda
+
+      Principal:
+        apigateway.amazonaws.com
+
+      SourceArn:
+        !Sub
+          "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${SchachApi}/*/GET/confirm"
+
+
+
+  # 23. API Deployment
+  ApiDeploymentCorsV2:
+    Type: AWS::ApiGateway::Deployment
+
+    DependsOn:
+      - ApiMethodUpload
+      - ApiMethodUploadOptions
+      - ApiMethodConfirmGet
+
+    Properties:
+      RestApiId:
+        !Ref SchachApi
+
+
+
+  # 24. API Stage
+  ApiStage:
+    Type: AWS::ApiGateway::Stage
+
+    Properties:
+      RestApiId:
+        !Ref SchachApi
+
+      DeploymentId:
+        !Ref ApiDeploymentCorsV2
+
+      StageName:
+        prod
+
+      MethodSettings:
+
+        - ResourcePath:
+            "/*"
+
+          HttpMethod:
+            "*"
+
+          ThrottlingRateLimit:
+            2
+
+          ThrottlingBurstLimit:
+            5
+
+
+
+  # 25. CodePipeline
+  SchachPipeline:
+    Type: AWS::CodePipeline::Pipeline
+
+    Properties:
+
+      Name:
+        schach-website-pipeline
+
+      RoleArn:
+        !GetAtt CodePipelineServiceRole.Arn
+
+      ArtifactStore:
+        Type:
+          S3
+
+        Location:
+          !Ref PipelineArtifactBucket
+
+
+      Stages:
+
+        - Name:
+            Source
+
+          Actions:
+
+            - Name:
+                SourceAction
+
+              ActionTypeId:
+
+                Category:
+                  Source
+
+                Owner:
+                  AWS
+
+                Provider:
+                  CodeCommit
+
+                Version:
+                  '1'
+
+              OutputArtifacts:
+
+                - Name:
+                    SourceOutput
+
+              Configuration:
+
+                RepositoryName:
+                  schach-simulation-repo
+
+                BranchName:
+                  main
+
+
+        - Name:
+            Deploy
+
+          Actions:
+
+            - Name:
+                DeployAction
+
+              ActionTypeId:
+
+                Category:
+                  Deploy
+
+                Owner:
+                  AWS
+
+                Provider:
+                  S3
+
+                Version:
+                  '1'
+
+              InputArtifacts:
+
+                - Name:
+                    SourceOutput
+
+              Configuration:
+
+                BucketName:
+                  !Ref WebsiteBucketV2
+
+                Extract:
+                  'true'
+
+
+
+Outputs:
+
+  WebsiteURL:
+    Description:
+      URL des S3 Website Buckets
+
+    Value:
+      !GetAtt WebsiteBucketV2.WebsiteURL
+
+
+  UploadApiUrl:
+    Description:
+      URL zum Anfordern einer Presigned Upload Policy
+
+    Value:
+      !Sub
+        "https://${SchachApi}.execute-api.${AWS::Region}.amazonaws.com/prod/upload"
+
+
+  ApiUrl:
+    Description:
+      Basis-URL des Bestätigungs-API-Gateways
+
+    Value:
+      !Sub
+        "https://${SchachApi}.execute-api.${AWS::Region}.amazonaws.com/prod"
+
+
+  SubmissionBucketName:
+    Description:
+      Name des privaten Submission Buckets
+
+    Value:
+      !Ref SubmissionBucket
+
+
+  NotificationTopicArn:
+    Description:
+      SNS Topic für Analysebenachrichtigungen
+
+    Value:
+      !Ref SchachNotificationTopic
+

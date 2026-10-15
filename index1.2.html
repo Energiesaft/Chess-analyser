@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+    <meta charset="UTF-8">
+    <title>Schach AWS - Zug-Upload</title>
+
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 50px;
+            text-align: center;
+        }
+
+        .status {
+            font-weight: bold;
+            margin-top: 15px;
+        }
+
+        .UPLOADING {
+            color: orange;
+        }
+
+        .UPLOADED {
+            color: green;
+        }
+
+        .ERROR {
+            color: red;
+        }
+    </style>
+</head>
+
+<body>
+
+    <h1>♟️ Schach-Simulation: Zug-Upload</h1>
+
+    <p>Lade deine Zugdatei hoch:</p>
+
+    <input
+        type="email"
+        id="userEmail"
+        placeholder="deine.email@beispiel.de"
+        required
+    >
+
+    <input
+        type="file"
+        id="moveFile"
+        accept=".txt,.eml"
+    >
+
+    <button onclick="uploadFile()">Hochladen</button>
+
+    <div id="statusMessage" class="status"></div>
+
+    <script>
+
+        function setStatus(text, stateClass) {
+            const statusDiv = document.getElementById("statusMessage");
+
+            statusDiv.textContent = "Status: " + text;
+            statusDiv.className = "status " + stateClass;
+        }
+
+
+        const UPLOAD_API_URL =
+    "https://gvnhf1yvr1.execute-api.us-east-1.amazonaws.com/prod/upload";
+
+function setStatus(text, stateClass) {
+    const statusDiv = document.getElementById("statusMessage");
+    statusDiv.textContent = "Status: " + text;
+    statusDiv.className = "status " + stateClass;
+}
+
+async function uploadFile() {
+    const emailInput =
+        document.getElementById("userEmail").value.trim();
+
+    const fileInput =
+        document.getElementById("moveFile");
+
+    if (!emailInput || fileInput.files.length === 0) {
+        alert("Bitte gib eine E-Mail-Adresse ein und wähle eine Datei aus!");
+        return;
+    }
+
+    const file = fileInput.files[0];
+
+    if (file.size === 0 || file.size > 262144) {
+        alert("Die Datei muss größer als 0 Byte und höchstens 256 KiB groß sein.");
+        return;
+    }
+
+    const extension = file.name.toLowerCase().split(".").pop();
+
+    if (!["txt", "eml"].includes(extension)) {
+        alert("Nur .txt- und .eml-Dateien sind erlaubt.");
+        return;
+    }
+
+    const contentType =
+        file.type || "application/octet-stream";
+
+    try {
+        setStatus("Upload wird vorbereitet ...", "UPLOADING");
+
+        // Schritt 1: Upload-Policy über API Gateway anfordern
+        const policyResponse = await fetch(UPLOAD_API_URL, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json"
+            },
+            body: JSON.stringify({
+                email: emailInput,
+                filename: file.name,
+                contentType: contentType
+            })
+        });
+
+        if (!policyResponse.ok) {
+            const details = await policyResponse.text();
+            throw new Error(
+                `Upload-API: HTTP ${policyResponse.status}: ${details}`
+            );
+        }
+
+        const result = await policyResponse.json();
+
+        if (!result.upload?.url || !result.upload?.fields) {
+            throw new Error("Die API hat keine gültige Upload-Policy geliefert.");
+        }
+
+        // Schritt 2: Datei mit der signierten POST-Policy hochladen
+        const formData = new FormData();
+
+        for (const [key, value] of Object.entries(result.upload.fields)) {
+            formData.append(key, value);
+        }
+
+        formData.append("file", file);
+
+        setStatus("Datei wird sicher hochgeladen ...", "UPLOADING");
+
+        const uploadResponse = await fetch(result.upload.url, {
+            method: "POST",
+            body: formData
+        });
+
+        if (!uploadResponse.ok) {
+            const details = await uploadResponse.text();
+            throw new Error(
+                `S3-Upload: HTTP ${uploadResponse.status}: ${details}`
+            );
+        }
+
+        setStatus("Datei erfolgreich hochgeladen.", "UPLOADED");
+
+        alert("Erfolgreich hochgeladen! Die Datei wird nun verarbeitet.");
+
+    } catch (error) {
+        console.error("Fehler beim Hochladen:", error);
+
+        setStatus("Fehler beim Hochladen.", "ERROR");
+
+        alert(error.message || "Fehler beim Hochladen.");
+    }
+}
+
+    </script>
+
+</body>
+</html>

@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+    <meta charset="UTF-8">
+    <title>Schach AWS - Zug-Upload</title>
+
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 50px;
+            text-align: center;
+        }
+
+        .status {
+            font-weight: bold;
+            margin-top: 15px;
+        }
+
+        .UPLOADING {
+            color: orange;
+        }
+
+        .UPLOADED {
+            color: green;
+        }
+
+        .ERROR {
+            color: red;
+        }
+    </style>
+</head>
+
+<body>
+
+    <h1>♟️ Schach-Simulation: Zug-Upload</h1>
+
+    <p>Lade deine Zugdatei hoch:</p>
+
+    <input
+        type="email"
+        id="userEmail"
+        placeholder="deine.email@beispiel.de"
+        required
+    >
+
+    <input
+        type="file"
+        id="moveFile"
+        accept=".txt,.eml"
+    >
+
+    <button onclick="uploadFile()">Hochladen</button>
+
+    <div id="statusMessage" class="status"></div>
+
+    <script>
+
+        function setStatus(text, stateClass) {
+            const statusDiv = document.getElementById("statusMessage");
+
+            statusDiv.textContent = "Status: " + text;
+            statusDiv.className = "status " + stateClass;
+        }
+
+
+        async function uploadFile() {
+
+            const emailInput =
+                document.getElementById("userEmail").value.trim();
+
+            const fileInput =
+                document.getElementById("moveFile");
+
+
+            if (!emailInput || fileInput.files.length === 0) {
+
+                alert(
+                    "Bitte gib eine E-Mail-Adresse ein und wähle eine Datei aus!"
+                );
+
+                return;
+            }
+
+
+            const file = fileInput.files[0];
+
+
+            // Vorläufig weiterhin direkter Upload auf S3.
+            // Die Sicherheitsverbesserung für den Upload-Endpunkt
+            // kommt im nächsten Schritt.
+
+            const accountId = "952938537163";
+
+            const uploadUrl =
+                `https://schach-simulation-bucket-${accountId}.s3.us-east-1.amazonaws.com/${encodeURIComponent(file.name)}`;
+
+
+            try {
+
+                setStatus("Datei wird hochgeladen ...", "UPLOADING");
+
+
+                const response = await fetch(uploadUrl, {
+
+                    method: "PUT",
+
+                    headers: {
+                        "Content-Type":
+                            file.type || "application/octet-stream",
+
+                        "x-amz-meta-email":
+                            emailInput
+                    },
+
+                    body: file
+
+                });
+
+
+                if (!response.ok) {
+
+                    throw new Error(
+                        `Upload fehlgeschlagen (Status: ${response.status})`
+                    );
+                }
+
+
+                setStatus(
+                    "Datei erfolgreich hochgeladen.",
+                    "UPLOADED"
+                );
+
+
+                alert(
+                    "Erfolgreich hochgeladen inklusive E-Mail-Verknüpfung!"
+                );
+
+            } catch (error) {
+
+                console.error("Fehler beim Hochladen:", error);
+
+                setStatus(
+                    "Fehler beim Hochladen.",
+                    "ERROR"
+                );
+
+                alert(
+                    "Fehler beim Hochladen."
+                );
+            }
+        }
+
+    </script>
+
+</body>
+</html>

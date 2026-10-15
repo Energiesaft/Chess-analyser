@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+    <meta charset="UTF-8">
+    <title>Schach AWS - Zug-Upload</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 50px; text-align: center; }
+        .status { font-weight: bold; margin-top: 15px; }
+        .UPLOADING { color: orange; }
+        .UPLOADED { color: green; }
+        .ERROR { color: red; }
+    </style>
+</head>
+<body>
+    <h1>♟️ Schach-Simulation: Zug-Upload</h1>
+    <p>Lade deine Zugdatei (E-Mail-Format) hoch:</p>
+    
+	<input type="email" id="userEmail" placeholder="deine.email@beispiel.de" required />
+    <input type="file" id="moveFile" accept=".txt,.eml">
+    <button onclick="uploadFile()">Hochladen</button>
+    
+    <div id="statusMessage" class="status"></div>
+
+    <script>
+        function setStatus(text, stateClass) {
+            const statusDiv = document.getElementById('statusMessage');
+            statusDiv.textContent = "Status: " + text;
+            statusDiv.className = "status " + stateClass;
+        }
+
+        async function uploadFile() {
+    const emailInput = document.getElementById('userEmail').value;
+    const fileInput = document.getElementById('moveFile');
+
+    if (!emailInput || fileInput.files.length === 0) {
+        alert("Bitte gib eine E-Mail-Adresse ein und wähle eine Datei aus!");
+        return;
+    }
+
+    const file = fileInput.files[0];
+    const accountId = "486264855094"; // Deine aktuelle Sandbox Account-ID
+    const uploadUrl = `https://schach-simulation-bucket-${accountId}.s3.us-east-1.amazonaws.com/${encodeURIComponent(file.name)}`;
+
+    try {
+        const response = await fetch(uploadUrl, {
+            method: 'PUT',
+            headers: {
+                'Content-Type': file.type || 'application/octet-stream',
+                'x-amz-meta-email': emailInput // E-Mail wird als S3-Metadatum übergeben
+            },
+            body: file
+        });
+
+        if (response.ok) {
+            alert("Erfolgreich hochgeladen inklusive E-Mail-Verknüpfung!");
+        } else {
+            throw new Error(`Upload fehlgeschlagen (Status: ${response.status})`);
+        }
+    } catch (error) {
+        console.error("Fehler:", error);
+        alert("Fehler beim Hochladen.");
+    }
+}
+    </script>
+</body>
+</html>

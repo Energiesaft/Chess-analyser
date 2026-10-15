@@ -1,0 +1,8 @@
+From: test@example.com
+To: chess-test@example.com
+Subject: Schach-Simulation Test - gueltig_40_zuege.txt
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+e2 e4 e7 e5 g1 f3 b8 c6 f1 c4 g8 f6 d2 d3 f8 c5 c2 c3 d7 d6 b1 d2 c8 g4 h2 h3 g4 h5 c1 e3 h5 g6 d1 b3 c5 b6 b3 f7
