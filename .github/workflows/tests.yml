@@ -1,4 +1,4 @@
-name: Test and deploy Schachformation
+name: CI tests
 
 on:
   push:
@@ -33,34 +33,6 @@ jobs:
         run: python -m pip install -r requirements-dev.txt
 
       - name: Run automated tests
-        run: python -m pytest -v tests/
-
-  deploy:
-    name: Deploy website to S3
-    needs: pytest
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      id-token: write
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Configure AWS credentials using OIDC
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: ${{ vars.AWS_REGION }}
-
-      - name: Upload website entry points
         env:
-          WEBSITE_BUCKET_NAME: ${{ vars.WEBSITE_BUCKET_NAME }}
-        run: |
-          set -euo pipefail
-          test -n "$WEBSITE_BUCKET_NAME"
-          test -f index.html
-          test -f error.html
-          aws s3 cp index.html "s3://$WEBSITE_BUCKET_NAME/index.html" --content-type "text/html; charset=utf-8"
-          aws s3 cp error.html "s3://$WEBSITE_BUCKET_NAME/error.html" --content-type "text/html; charset=utf-8"
+          CLOUDFORMATION_TEMPLATE: ../Schachformation1.7_SNS_IAM_Fix.yml
+        run: python -m pytest -v tests/
