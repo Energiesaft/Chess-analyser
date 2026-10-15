@@ -34,5 +34,5 @@ jobs:
 
       - name: Run automated tests
         env:
-          CLOUDFORMATION_TEMPLATE: ../Schachformation1.7_SNS_IAM_Fix.yml
+          CLOUDFORMATION_TEMPLATE: ../Schachformation.yml
         run: python -m pytest -v tests/
