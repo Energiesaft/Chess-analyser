@@ -7,8 +7,8 @@ import textwrap
 
 import pytest
 
-ROOT = Path(__file__).resolve().parents[1]
-TEMPLATE = Path(os.environ.get("CLOUDFORMATION_TEMPLATE", ROOT / "Schachformation1.7_SNS_IAM_Fix.yml"))
+REPO_ROOT = Path(__file__).resolve().parents[2]
+TEMPLATE = Path(os.environ.get("CLOUDFORMATION_TEMPLATE", REPO_ROOT / "Schachformation.yml"))
 
 
 def extract_inline_lambda_sources(template_text: str) -> dict[str, str]:
