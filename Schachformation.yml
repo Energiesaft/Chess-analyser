@@ -2243,3 +2243,51 @@ Resources:
     Value:
       !Ref SchachNotificationTopic
 
+Outputs:
+
+  WebsiteBucketName:
+    Description: Name of the public website bucket
+    Value: !Ref WebsiteBucketV2
+
+  WebsiteURL:
+    Description:
+      URL des S3 Website Buckets
+
+    Value:
+      !GetAtt WebsiteBucketV2.WebsiteURL
+
+
+  UploadApiUrl:
+    Description:
+      URL zum Anfordern einer Presigned Upload Policy
+
+    Value:
+      !Sub
+        "https://${SchachApi}.execute-api.${AWS::Region}.amazonaws.com/prod/upload"
+
+
+  ApiUrl:
+    Description:
+      Basis-URL des Bestätigungs-API-Gateways
+
+    Value:
+      !Sub
+        "https://${SchachApi}.execute-api.${AWS::Region}.amazonaws.com/prod"
+
+
+  SubmissionBucketName:
+    Description:
+      Name des privaten Submission Buckets
+
+    Value:
+      !Ref SubmissionBucket
+
+
+  NotificationTopicArn:
+    Description:
+      SNS Topic für Analysebenachrichtigungen
+
+    Value:
+      !Ref SchachNotificationTopic
+
+
