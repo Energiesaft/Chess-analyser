@@ -1,5 +1,5 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: AWS-native Schach-Simulation mit S3, DynamoDB, SNS-Analyse und API Gateway
+Description: AWS-native Schach-Simulation v1.8 mit Token-Ablaufprüfung und begrenztem SNS-Publish-Retry
 
 Resources:
 
@@ -169,6 +169,7 @@ Resources:
           import os
           import boto3
           import uuid
+          import time
 
           s3 = boto3.client('s3')
           dynamodb = boto3.resource('dynamodb')
@@ -178,6 +179,19 @@ Resources:
           SNS_TOPIC_ARN = os.environ['SNS_TOPIC_ARN']
           API_BASE_URL = os.environ['API_BASE_URL']
           table = dynamodb.Table(TABLE_NAME)
+
+          def publish_with_retry(**kwargs):
+              """Retry transient SNS publish errors up to three attempts."""
+              last_error = None
+              for attempt in range(3):
+                  try:
+                      return sns.publish(**kwargs)
+                  except Exception as error:
+                      last_error = error
+                      print(f"SNS Publish fehlgeschlagen (Versuch {attempt + 1}/3): {error}")
+                      if attempt < 2:
+                          time.sleep(attempt + 1)
+              raise last_error
 
           def lambda_handler(event, context):
               for record in event['Records']:
@@ -201,7 +215,8 @@ Resources:
                           'Email': email,
                           'FileKey': key,
                           'Status': 'PENDING',
-                          'Used': False
+                          'Used': False,
+                          'ExpiresAt': int(time.time()) + 86400
                       }
                   )
 
@@ -219,7 +234,7 @@ Resources:
 
                   # Bestätigungslink per SNS an den Absender senden
                   try:
-                      sns.publish(
+                      publish_with_retry(
                           TopicArn=SNS_TOPIC_ARN,
                           Subject='Bestätigung deiner Schach-Einreichung',
                           Message=f"Hallo!\n\nVielen Dank für deine Schach-Einreichung ({key}).\n\nBitte klicke auf den folgenden Link, um deine E-Mail zu bestätigen und die Analyse zu starten:\n{confirmation_link}\n\nVielen Dank!"
@@ -291,6 +306,7 @@ Resources:
           import json
           import os
           import boto3
+          import time
           from botocore.exceptions import ClientError
 
           dynamodb = boto3.resource('dynamodb')
@@ -378,16 +394,18 @@ Resources:
                   response = table.update_item(
                       Key={'Token': token},
                       UpdateExpression='SET #status = :proc, #used = :val',
-                      ConditionExpression='attribute_exists(#tokenKey) AND #used = :falseVal',
+                      ConditionExpression='attribute_exists(#tokenKey) AND #used = :falseVal AND attribute_exists(#expiresAt) AND #expiresAt > :now',
                       ExpressionAttributeNames={
                           '#status': 'Status',
                           '#used': 'Used',
-                          '#tokenKey': 'Token'
+                          '#tokenKey': 'Token',
+                          '#expiresAt': 'ExpiresAt'
                       },
                       ExpressionAttributeValues={
                           ':proc': 'PROCESSING',
                           ':val': True,
-                          ':falseVal': False
+                          ':falseVal': False,
+                          ':now': int(time.time())
                       },
                       ReturnValues='ALL_NEW'
                   )
