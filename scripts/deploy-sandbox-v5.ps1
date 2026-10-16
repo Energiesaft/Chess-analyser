@@ -122,8 +122,17 @@ try {
     Write-Host "Creating a CloudFormation change set ($type). The stack will not be changed until approval."
     Invoke-Aws -AwsArgs @("cloudformation","create-change-set","--stack-name",$StackName,"--change-set-name",$changeSetName,"--change-set-type",$type,"--template-url",$templateUrl,"--capabilities","CAPABILITY_IAM","--region",$Region,"--tags","Project=Chess-analyser","ManagedBy=CloudFormation","--output","json") | Out-Host
     $changeSetCreated = $true
-    Invoke-Aws -AwsArgs @("cloudformation","wait","change-set-create-complete","--stack-name",$StackName,"--change-set-name",$changeSetName,"--region",$Region) | Out-Host
-    $cs = Get-AwsJson -AwsArgs @("cloudformation","describe-change-set","--stack-name",$StackName,"--change-set-name",$changeSetName,"--region",$Region,"--output","json")
+    # Poll instead of using the AWS waiter: a valid no-op change set can end in FAILED
+    # with a "no changes" reason, which the waiter would otherwise treat as an opaque error.
+    $cs = $null
+    for ($attempt = 0; $attempt -lt 60; $attempt++) {
+        Start-Sleep -Seconds 2
+        $cs = Get-AwsJson -AwsArgs @("cloudformation","describe-change-set","--stack-name",$StackName,"--change-set-name",$changeSetName,"--region",$Region,"--output","json")
+        if ($cs.Status -in @("CREATE_COMPLETE","FAILED")) { break }
+    }
+    if ($null -eq $cs -or $cs.Status -notin @("CREATE_COMPLETE","FAILED")) {
+        throw "Timed out waiting for change set creation. Inspect change set '$changeSetName' in AWS Console."
+    }
 
     if ($cs.Status -ne "CREATE_COMPLETE") {
         if ($cs.StatusReason -match "didn't contain changes|No updates are to be performed") {
