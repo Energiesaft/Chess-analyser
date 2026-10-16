@@ -56,7 +56,7 @@ function Test-BucketSecurity {
 
 try {
     $root = Split-Path -Parent $PSScriptRoot
-    $template = Join-Path $root "Schachformation1.7_SNS_IAM_Fix.yml"
+    $template = Join-Path $root "Schachformation1.8.yml"
     $indexSource = Join-Path $root "index1.2.html"
     $errorSource = Join-Path $root "error.html"
     $tempIndex = Join-Path $env:TEMP ("chess-index-" + [guid]::NewGuid().ToString("N") + ".html")
@@ -99,7 +99,7 @@ try {
         Test-BucketSecurity -Bucket $bootstrap
     }
 
-    $templateKey = "cloudformation-templates/Schachformation1.7_SNS_IAM_Fix-$((Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssZ'))-$([guid]::NewGuid().ToString('N').Substring(0,8)).yml"
+    $templateKey = "cloudformation-templates/Schachformation1.8-$((Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssZ'))-$([guid]::NewGuid().ToString('N').Substring(0,8)).yml"
     $templateUrl = "https://$bootstrap.s3.$Region.amazonaws.com/$templateKey"
     Write-Host "Uploading versioned template to s3://$bootstrap/$templateKey"
     Invoke-Aws -AwsArgs @("s3","cp",$template,"s3://$bootstrap/$templateKey","--content-type","text/yaml; charset=utf-8","--region",$Region) | Out-Host
