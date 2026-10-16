@@ -56,7 +56,7 @@ function Test-BucketSecurity {
 
 try {
     $root = Split-Path -Parent $PSScriptRoot
-    $template = Join-Path $root "Schachformation1.7_SNS_IAM_Fix.yml"
+    $template = Join-Path $root "Schachformation1.8.yml"
     $indexSource = Join-Path $root "index1.2.html"
     $errorSource = Join-Path $root "error.html"
     $tempIndex = Join-Path $env:TEMP ("chess-index-" + [guid]::NewGuid().ToString("N") + ".html")
@@ -99,7 +99,7 @@ try {
         Test-BucketSecurity -Bucket $bootstrap
     }
 
-    $templateKey = "cloudformation-templates/Schachformation1.7_SNS_IAM_Fix-$((Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssZ'))-$([guid]::NewGuid().ToString('N').Substring(0,8)).yml"
+    $templateKey = "cloudformation-templates/Schachformation1.8-$((Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssZ'))-$([guid]::NewGuid().ToString('N').Substring(0,8)).yml"
     $templateUrl = "https://$bootstrap.s3.$Region.amazonaws.com/$templateKey"
     Write-Host "Uploading versioned template to s3://$bootstrap/$templateKey"
     Invoke-Aws -AwsArgs @("s3","cp",$template,"s3://$bootstrap/$templateKey","--content-type","text/yaml; charset=utf-8","--region",$Region) | Out-Host
@@ -134,15 +134,18 @@ try {
         throw "Timed out waiting for change set creation. Inspect change set '$changeSetName' in AWS Console."
     }
 
+    $noStackChanges = $false
     if ($cs.Status -ne "CREATE_COMPLETE") {
         if ($cs.StatusReason -match "didn't contain changes|No updates are to be performed") {
-            Write-Host "No stack changes detected. Nothing will be executed."
-            return
+            Write-Host "No stack changes detected. Skipping stack execution and continuing to frontend publishing."
+            $noStackChanges = $true
+        } else {
+            throw "Change set is not ready: $($cs.Status) - $($cs.StatusReason)"
         }
-        throw "Change set is not ready: $($cs.Status) - $($cs.StatusReason)"
     }
 
-    Write-Host ([Environment]::NewLine + "=== PROPOSED CLOUDFORMATION CHANGES ===") -ForegroundColor Yellow
+    if (-not $noStackChanges) {
+        Write-Host ([Environment]::NewLine + "=== PROPOSED CLOUDFORMATION CHANGES ===") -ForegroundColor Yellow
     $rows = @($cs.Changes | ForEach-Object {
         [pscustomobject]@{
             Action = $_.ResourceChange.Action
@@ -170,6 +173,7 @@ try {
     } else {
         Invoke-Aws -AwsArgs @("cloudformation","wait","stack-update-complete","--stack-name",$StackName,"--region",$Region) | Out-Host
     }
+    } # end if (-not $noStackChanges)
 
     $resources = Get-AwsJson -AwsArgs @("cloudformation","describe-stack-resources","--stack-name",$StackName,"--region",$Region,"--output","json")
     $website = @($resources.StackResources | Where-Object { $_.LogicalResourceId -eq "WebsiteBucketV2" })
@@ -181,21 +185,49 @@ try {
     if ($apiOut.Count -ne 1 -or [string]::IsNullOrWhiteSpace([string]$apiOut[0].OutputValue)) {
         throw "UploadApiUrl output is missing; frontend upload skipped."
     }
-    $apiBase = [string]$apiOut[0].OutputValue
-    if ($apiBase -notmatch '^https://[a-z0-9]+\.execute-api\.[a-z0-9-]+\.amazonaws\.com/prod/?$') {
-        throw "UploadApiUrl has an unexpected format; frontend upload skipped."
+    # UploadApiUrl already contains /prod/upload in the CloudFormation outputs.
+    $uploadApiUrl = ([string]$apiOut[0].OutputValue).TrimEnd('/')
+    if ($uploadApiUrl -notmatch '^https://[a-z0-9]+\.execute-api\.[a-z0-9-]+\.amazonaws\.com/prod/upload
+    Invoke-Aws -AwsArgs @("cloudformation","describe-stacks","--stack-name",$StackName,"--region",$Region,"--query","Stacks[0].Outputs[*].[OutputKey,OutputValue]","--output","table") | Out-Host
+    Write-Host "Deployment completed. No AWS resources were automatically deleted."
+    Write-Host "Retained template: s3://$bootstrap/$templateKey"
+}
+catch {
+    Write-Error $_
+    if ($changeSetCreated -and -not $changeSetExecuted -and $changeSetName) {
+        Write-Warning "Unexecuted change set may remain: $changeSetName. It was not automatically deleted."
+    }
+    if ($templateKey) { Write-Warning "Template object may remain for audit: $templateKey" }
+    throw
+}
+finally {
+    if ($tempIndex -and (Test-Path -LiteralPath $tempIndex)) {
+        Remove-Item -LiteralPath $tempIndex -Force -ErrorAction SilentlyContinue
+    }
+    if ($null -eq $oldPythonUtf8) { Remove-Item Env:PYTHONUTF8 -ErrorAction SilentlyContinue } else { $env:PYTHONUTF8 = $oldPythonUtf8 }
+    if ($null -eq $oldAwsEncoding) { Remove-Item Env:AWS_CLI_FILE_ENCODING -ErrorAction SilentlyContinue } else { $env:AWS_CLI_FILE_ENCODING = $oldAwsEncoding }
+}
+) {
+        throw "UploadApiUrl has an unexpected format: $uploadApiUrl"
     }
 
     $html = [System.IO.File]::ReadAllText($indexSource,[System.Text.Encoding]::UTF8)
     $pattern = 'https://[a-z0-9]+\.execute-api\.[a-z0-9-]+\.amazonaws\.com/prod/upload'
-    if (-not [regex]::IsMatch($html,$pattern)) { throw "Expected API URL pattern not found in index1.2.html; refusing to publish." }
-    $html = [regex]::Replace($html,$pattern,[System.Text.RegularExpressions.MatchEvaluator]{ param($m) $apiBase.TrimEnd('/') + "/upload" })
+    if (-not [regex]::IsMatch($html,$pattern)) { throw "Expected API Gateway /prod/upload URL not found in index1.2.html; refusing to publish." }
+    $html = [regex]::Replace($html,$pattern,[System.Text.RegularExpressions.MatchEvaluator]{ param($m) $uploadApiUrl })
     [System.IO.File]::WriteAllText($tempIndex,$html,[System.Text.UTF8Encoding]::new($false))
 
     $bucket = [string]$website[0].PhysicalResourceId
-    Write-Host "Publishing frontend to s3://$bucket/"
+    Write-Host "Publishing index1.2.html as index.html to s3://$bucket with API $uploadApiUrl"
     Invoke-Aws -AwsArgs @("s3","cp",$tempIndex,"s3://$bucket/index.html","--content-type","text/html; charset=utf-8","--region",$Region) | Out-Host
-    Invoke-Aws -AwsArgs @("s3","cp",$errorSource,"s3://$bucket/error.html","--content-type","text/html; charset=utf-8","--region",$Region) | Out-Host
+    if ((Test-Path -LiteralPath $errorSource -PathType Leaf) -and (Get-Item -LiteralPath $errorSource).Length -gt 0) {
+        Invoke-Aws -AwsArgs @("s3","cp",$errorSource,"s3://$bucket/error.html","--content-type","text/html; charset=utf-8","--region",$Region) | Out-Host
+    } else {
+        Write-Warning "error.html is empty or missing; skipping optional error page upload."
+    }
+    $head = Get-AwsJson -AwsArgs @("s3api","head-object","--bucket",$bucket,"--key","index.html","--region",$Region,"--output","json")
+    if ([long]$head.ContentLength -le 0) { throw "Frontend verification failed: s3://$bucket/index.html is empty." }
+    Write-Host "Frontend upload verified ($($head.ContentLength) bytes)." -ForegroundColor Green
     Invoke-Aws -AwsArgs @("cloudformation","describe-stacks","--stack-name",$StackName,"--region",$Region,"--query","Stacks[0].Outputs[*].[OutputKey,OutputValue]","--output","table") | Out-Host
     Write-Host "Deployment completed. No AWS resources were automatically deleted."
     Write-Host "Retained template: s3://$bootstrap/$templateKey"
