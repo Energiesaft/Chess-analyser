@@ -134,15 +134,18 @@ try {
         throw "Timed out waiting for change set creation. Inspect change set '$changeSetName' in AWS Console."
     }
 
+    $noStackChanges = $false
     if ($cs.Status -ne "CREATE_COMPLETE") {
         if ($cs.StatusReason -match "didn't contain changes|No updates are to be performed") {
-            Write-Host "No stack changes detected. Nothing will be executed."
-            return
+            Write-Host "No stack changes detected. Skipping stack execution and continuing to frontend publishing."
+            $noStackChanges = $true
+        } else {
+            throw "Change set is not ready: $($cs.Status) - $($cs.StatusReason)"
         }
-        throw "Change set is not ready: $($cs.Status) - $($cs.StatusReason)"
     }
 
-    Write-Host ([Environment]::NewLine + "=== PROPOSED CLOUDFORMATION CHANGES ===") -ForegroundColor Yellow
+    if (-not $noStackChanges) {
+        Write-Host ([Environment]::NewLine + "=== PROPOSED CLOUDFORMATION CHANGES ===") -ForegroundColor Yellow
     $rows = @($cs.Changes | ForEach-Object {
         [pscustomobject]@{
             Action = $_.ResourceChange.Action
@@ -170,6 +173,7 @@ try {
     } else {
         Invoke-Aws -AwsArgs @("cloudformation","wait","stack-update-complete","--stack-name",$StackName,"--region",$Region) | Out-Host
     }
+    } # end if (-not $noStackChanges)
 
     $resources = Get-AwsJson -AwsArgs @("cloudformation","describe-stack-resources","--stack-name",$StackName,"--region",$Region,"--output","json")
     $website = @($resources.StackResources | Where-Object { $_.LogicalResourceId -eq "WebsiteBucketV2" })
