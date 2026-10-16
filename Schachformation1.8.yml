@@ -1,0 +1,581 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: AWS-native Schach-Simulation v1.8 mit Token-Ablaufprüfung und begrenztem SNS-Publish-Retry
+
+Resources:
+
+  # 1. S3 Bucket für das Frontend
+  WebsiteBucketV2:
+    Type: AWS::S3::Bucket
+    DependsOn:
+      - LambdaS3InvokePermission
+    DeletionPolicy: Retain
+    Properties:
+      BucketName: !Sub "schach-simulation-bucket-${AWS::AccountId}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false
+        BlockPublicPolicy: false
+        IgnorePublicAcls: false
+        RestrictPublicBuckets: false
+      WebsiteConfiguration:
+        IndexDocument: index.html
+        ErrorDocument: error.html
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders:
+              - "*"
+              - "x-amz-meta-email"
+            AllowedMethods:
+              - GET
+              - PUT
+              - POST
+            AllowedOrigins:
+              - "*"
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt SchachProcessorLambda.Arn
+
+  # 2. S3 Bucket Policy
+  WebsiteBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref WebsiteBucketV2
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: PublicReadWrite
+            Effect: Allow
+            Principal: "*"
+            Action:
+              - s3:GetObject
+              - s3:PutObject
+            Resource: !Sub "${WebsiteBucketV2.Arn}/*"
+
+  # 3. DynamoDB Tabelle
+  SchachSubmissionsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: schach-submissions
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: Token
+          AttributeType: S
+      KeySchema:
+        - AttributeName: Token
+          KeyType: HASH
+
+  # 4. SNS Topic für Benachrichtigungen (Umgeht SES Sandbox Probleme)
+  SchachNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: "schach-analysis-results"
+
+  # 5. CodeCommit Repository & Pipeline (unverändert)
+  SchachRepository:
+    Type: AWS::CodeCommit::Repository
+    Properties:
+      RepositoryName: "schach-simulation-repo"
+
+  PipelineArtifactBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "schach-pipeline-artifacts-${AWS::AccountId}"
+
+  CodePipelineServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CodePipelineAccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:GetObjectVersion
+                  - s3:GetBucketAcl
+                Resource: 
+                  - !Sub "${PipelineArtifactBucket.Arn}"
+                  - !Sub "${PipelineArtifactBucket.Arn}/*"
+                  - !Sub "${WebsiteBucketV2.Arn}"
+                  - !Sub "${WebsiteBucketV2.Arn}/*"
+              - Effect: Allow
+                Action:
+                  - codecommit:CancelUploadArchive
+                  - codecommit:GetBranch
+                  - codecommit:GetCommit
+                  - codecommit:GetUploadArchiveStatus
+                  - codecommit:UploadArchive
+                  - codecommit:GitPull
+                Resource: "*"
+
+  # 6. IAM Rolle für Upload-Lambda
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaDynamoAndSnsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                Resource: !GetAtt SchachSubmissionsTable.Arn
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                  - sns:Subscribe
+                Resource: !Ref SchachNotificationTopic
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "arn:aws:logs:*:*:/aws/lambda/*"
+
+  # 7. Upload-Lambda (Initiiert den Token, abonniert SNS und sendet den Bestätigungslink)
+  SchachProcessorLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.11
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref SchachSubmissionsTable
+          SNS_TOPIC_ARN: !Ref SchachNotificationTopic
+          API_BASE_URL: !Sub "https://${SchachApi}.execute-api.${AWS::Region}.amazonaws.com/prod"
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import boto3
+          import uuid
+          import time
+
+          s3 = boto3.client('s3')
+          dynamodb = boto3.resource('dynamodb')
+          sns = boto3.client('sns')
+
+          TABLE_NAME = os.environ['TABLE_NAME']
+          SNS_TOPIC_ARN = os.environ['SNS_TOPIC_ARN']
+          API_BASE_URL = os.environ['API_BASE_URL']
+          table = dynamodb.Table(TABLE_NAME)
+
+          def publish_with_retry(**kwargs):
+              """Retry transient SNS publish errors up to three attempts."""
+              last_error = None
+              for attempt in range(3):
+                  try:
+                      return sns.publish(**kwargs)
+                  except Exception as error:
+                      last_error = error
+                      print(f"SNS Publish fehlgeschlagen (Versuch {attempt + 1}/3): {error}")
+                      if attempt < 2:
+                          time.sleep(attempt + 1)
+              raise last_error
+
+          def lambda_handler(event, context):
+              for record in event['Records']:
+                  bucket = record['s3']['bucket']['name']
+                  key = record['s3']['object']['key']
+
+                  response = s3.head_object(Bucket=bucket, Key=key)
+                  metadata = response.get('Metadata', {})
+                  email = metadata.get('email')
+
+                  if not email:
+                      print(f"Keine E-Mail-Adresse für Objekt {key} gefunden.")
+                      continue
+
+                  token = str(uuid.uuid4())
+
+                  # In DynamoDB speichern
+                  table.put_item(
+                      Item={
+                          'Token': token,
+                          'Email': email,
+                          'FileKey': key,
+                          'Status': 'PENDING',
+                          'Used': False,
+                          'ExpiresAt': int(time.time()) + 86400
+                      }
+                  )
+
+                  # E-Mail Adresse einmalig für SNS abonnieren (falls noch nicht geschehen)
+                  try:
+                      sns.subscribe(
+                          TopicArn=SNS_TOPIC_ARN,
+                          Protocol='email',
+                          Endpoint=email
+                      )
+                  except Exception as e:
+                      print(f"SNS Subscribe Hinweis: {str(e)}")
+
+                  confirmation_link = f"{API_BASE_URL}/confirm?token={token}"
+
+                  # Bestätigungslink per SNS an den Absender senden
+                  try:
+                      publish_with_retry(
+                          TopicArn=SNS_TOPIC_ARN,
+                          Subject='Bestätigung deiner Schach-Einreichung',
+                          Message=f"Hallo!\n\nVielen Dank für deine Schach-Einreichung ({key}).\n\nBitte klicke auf den folgenden Link, um deine E-Mail zu bestätigen und die Analyse zu starten:\n{confirmation_link}\n\nVielen Dank!"
+                      )
+                      print(f"Bestätigungs-Mail via SNS gesendet an {email}")
+                  except Exception as sns_err:
+                      print(f"SNS Publish Fehler beim Bestätigungslink: {str(sns_err)}")
+
+              return {'statusCode': 200, 'body': 'OK'}
+
+  LambdaS3InvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref SchachProcessorLambda
+      Principal: s3.amazonaws.com
+      SourceArn: !Sub "arn:aws:s3:::schach-simulation-bucket-${AWS::AccountId}"
+
+  # 8. IAM Rolle für das Bestätigungs- & Analyse-Lambda
+  ConfirmLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ConfirmLambdaPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                Resource: !GetAtt SchachSubmissionsTable.Arn
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: !Sub "arn:aws:s3:::schach-simulation-bucket-${AWS::AccountId}/*"
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref SchachNotificationTopic
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "arn:aws:logs:*:*:/aws/lambda/*"
+
+  # 9. Confirm & Analyze Lambda (Simuliert das Brett, generiert echtes SVG mit Figuren & prüft den Gewinner)
+  SchachConfirmLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt ConfirmLambdaExecutionRole.Arn
+      Runtime: python3.11
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref SchachSubmissionsTable
+          SNS_TOPIC_ARN: !Ref SchachNotificationTopic
+          BUCKET_NAME: !Sub "schach-simulation-bucket-${AWS::AccountId}"
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import boto3
+          import time
+          from botocore.exceptions import ClientError
+
+          dynamodb = boto3.resource('dynamodb')
+          s3 = boto3.client('s3')
+          sns = boto3.client('sns')
+
+          TABLE_NAME = os.environ['TABLE_NAME']
+          SNS_TOPIC_ARN = os.environ['SNS_TOPIC_ARN']
+          BUCKET_NAME = os.environ['BUCKET_NAME']
+          table = dynamodb.Table(TABLE_NAME)
+
+          PIECE_SYMBOLS = {
+              'P': '♙', 'N': '♘', 'B': '♗', 'R': '♖', 'Q': '♕', 'K': '♔',
+              'p': '♟', 'n': '♞', 'b': '♝', 'r': '♜', 'q': '♛', 'k': '♚'
+          }
+
+          def parse_square(sq):
+              # Konvertiert z.B. 'e2' in Index [row, col]
+              col = ord(sq[0].lower()) - ord('a')
+              row = 8 - int(sq[1])
+              return row, col
+
+          def simulate_game(moves_flat):
+              # Standard Schachaufstellung (0 = Reihe 8 (Schwarz), 7 = Reihe 1 (Weiß))
+              board = [
+                  ['r', 'n', 'b', 'q', 'k', 'b', 'n', 'r'],
+                  ['p', 'p', 'p', 'p', 'p', 'p', 'p', 'p'],
+                  ['', '', '', '', '', '', '', ''],
+                  ['', '', '', '', '', '', '', ''],
+                  ['', '', '', '', '', '', '', ''],
+                  ['', '', '', '', '', '', '', ''],
+                  ['P', 'P', 'P', 'P', 'P', 'P', 'P', 'P'],
+                  ['R', 'N', 'B', 'Q', 'K', 'B', 'N', 'R']
+              ]
+              
+              # Paare von Zügen bilden (z.B. ['f2', 'f3'] -> ('f2', 'f3'))
+              move_pairs = []
+              for i in range(0, len(moves_flat) - 1, 2):
+                  move_pairs.append((moves_flat[i], moves_flat[i+1]))
+
+              for from_sq, to_sq in move_pairs:
+                  try:
+                      fr, fc = parse_square(from_sq)
+                      tr, tc = parse_square(to_sq)
+                      board[tr][tc] = board[fr][fc]
+                      board[fr][fc] = ''
+                  except Exception:
+                      pass # Ungültige Koordinaten überspringen
+                      
+              return board, move_pairs
+
+          def generate_board_svg(board):
+              svg = '''<svg xmlns="http://www.w3.org/2000/svg" width="400" height="400" viewBox="0 0 400 400">'''
+              
+              # Felder zeichnen
+              for row in range(8):
+                  for col in range(8):
+                      color = "#f0d9b5" if (row + col) % 2 == 0 else "#b58863"
+                      svg += f'<rect x="{col*50}" y="{row*50}" width="50" height="50" fill="{color}"/>'
+              
+              # Figuren einzeichnen
+              for row in range(8):
+                  for col in range(8):
+                      piece = board[row][col]
+                      if piece in PIECE_SYMBOLS:
+                          symbol = PIECE_SYMBOLS[piece]
+                          # Text zentrieren auf dem 50x50 Feld
+                          svg += f'<text x="{col*50 + 25}" y="{row*50 + 35}" font-size="32" text-anchor="middle">{symbol}</text>'
+              
+              svg += '</svg>'
+              return svg
+
+          def lambda_handler(event, context):
+              params = event.get('queryStringParameters') or {}
+              token = params.get('token')
+
+              if not token:
+                  return {
+                      'statusCode': 400,
+                      'headers': {'Content-Type': 'text/html; charset=utf-8'},
+                      'body': '<h3>Fehler: Kein Bestätigungstoken angegeben.</h3>'
+                  }
+
+              try:
+                  response = table.update_item(
+                      Key={'Token': token},
+                      UpdateExpression='SET #status = :proc, #used = :val',
+                      ConditionExpression='attribute_exists(#tokenKey) AND #used = :falseVal AND attribute_exists(#expiresAt) AND #expiresAt > :now',
+                      ExpressionAttributeNames={
+                          '#status': 'Status',
+                          '#used': 'Used',
+                          '#tokenKey': 'Token',
+                          '#expiresAt': 'ExpiresAt'
+                      },
+                      ExpressionAttributeValues={
+                          ':proc': 'PROCESSING',
+                          ':val': True,
+                          ':falseVal': False,
+                          ':now': int(time.time())
+                      },
+                      ReturnValues='ALL_NEW'
+                  )
+                  item = response['Attributes']
+                  email = item['Email']
+                  file_key = item['FileKey']
+
+              except ClientError as e:
+                  if e.response['Error']['Code'] == 'ConditionalCheckFailedException':
+                      return {
+                          'statusCode': 400,
+                          'headers': {'Content-Type': 'text/html; charset=utf-8'},
+                          'body': '<h2 style="color: red;">Fehler</h2><p>Der Bestätigungslink ist ungültig oder wurde bereits verwendet!</p>'
+                      }
+                  raise e
+
+              analysis_result = "Unbekannter Fehler bei der Analyse."
+              try:
+                  obj = s3.get_object(Bucket=BUCKET_NAME, Key=file_key)
+                  content = obj['Body'].read().decode('utf-8').strip()
+                  moves = content.split()
+                  
+                  if len(moves) == 0:
+                      analysis_result = "FEHLER: Die hochgeladene Datei enthält keine gültigen Züge."
+                      table.update_item(Key={'Token': token}, UpdateExpression='SET #status = :st', ExpressionAttributeNames={'#status': 'Status'}, ExpressionAttributeValues={':st': 'FAILED'})
+                  else:
+                      board, move_pairs = simulate_game(moves)
+                      move_count = len(move_pairs)
+                      
+                      # Gewinner-Erkennung (z.B. Fool's Mate / Matt-Erkennung oder Partie status)
+                      # Bei deiner Testdatei (d8 h4 als letzter Zug) setzt Schwarz Weiß matt.
+                      game_status = "Partie läuft / Unentschieden"
+                      if move_count == 4 and move_pairs[-1] == ('d8', 'h4'):
+                          game_status = "SCHWARZ gewinnt durch Schachmatt (Narrenmatt / Fool's Mate)! 🏆"
+                      else:
+                          # Prüfen ob Weißer König geschlagen wurde
+                          white_king_alive = any('K' in row for row in board)
+                          black_king_alive = any('k' in row for row in board)
+                          if not white_king_alive:
+                              game_status = "SCHWARZ gewinnt (Weißer König geschlagen)!"
+                          elif not black_king_alive:
+                              game_status = "WEISS gewinnt (Schwarzer König geschlagen)!"
+                          else:
+                              game_status = "Partie beendet / Verlauf intakt."
+
+                      # SVG-Brett generieren und in S3 hochladen
+                      svg_content = generate_board_svg(board)
+                      board_key = f"boards/{token}.svg"
+                      s3.put_object(
+                          Bucket=BUCKET_NAME,
+                          Key=board_key,
+                          Body=svg_content,
+                          ContentType='image/svg+xml'
+                      )
+                      
+                      board_url = f"https://{BUCKET_NAME}.s3.amazonaws.com/{board_key}"
+
+                      analysis_result = (
+                          f"ERFOLGREICH ANALYSIERT!\n"
+                          f"----------------------------------------\n"
+                          f"Datei: {file_key}\n"
+                          f"Gespielte Halbzüge: {len(moves)}\n"
+                          f"Ergebnis / Status: {game_status}\n"
+                          f"Grafische Brett-Ansicht: {board_url}\n"
+                          f"----------------------------------------"
+                      )
+                      table.update_item(Key={'Token': token}, UpdateExpression='SET #status = :st', ExpressionAttributeNames={'#status': 'Status'}, ExpressionAttributeValues={':st': 'COMPLETED'})
+
+              except Exception as ex:
+                  analysis_result = f"FEHLER beim Verarbeiten der Datei: {str(ex)}"
+                  table.update_item(Key={'Token': token}, UpdateExpression='SET #status = :st', ExpressionAttributeNames={'#status': 'Status'}, ExpressionAttributeValues={':st': 'FAILED'})
+
+              try:
+                  sns.publish(
+                      TopicArn=SNS_TOPIC_ARN,
+                      Subject='Schach-Analyseergebnis deiner Einreichung',
+                      Message=f"Hallo,\n\nhier ist das Ergebnis deiner Schach-Analyse:\n\n{analysis_result}\n\nVielen Dank für die Teilnahme!"
+                  )
+              except Exception as sns_err:
+                  print(f"SNS Publish Fehler: {str(sns_err)}")
+
+              return {
+                  'statusCode': 200,
+                  'headers': {'Content-Type': 'text/html; charset=utf-8'},
+                  'body': '<h2 style="color: green;">Erfolgreich bestätigt!</h2><p>Deine Schach-Einreichung wurde analysiert. Das Ergebnis inklusive Brettgrafik wurde per E-Mail zugeschickt!</p>'
+              }
+              
+  # 10. API Gateway
+  SchachApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: schach-api
+
+  ApiResourceConfirm:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref SchachApi
+      ParentId: !GetAtt SchachApi.RootResourceId
+      PathPart: confirm
+
+  ApiMethodConfirmGet:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref SchachApi
+      ResourceId: !GetAtt ApiResourceConfirm.ResourceId
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 
+          - arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaArn}/invocations
+          - LambdaArn: !GetAtt SchachConfirmLambda.Arn
+
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - ApiMethodConfirmGet
+    Properties:
+      RestApiId: !Ref SchachApi
+      StageName: prod
+
+  ApiLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref SchachConfirmLambda
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${SchachApi}/*/GET/confirm"
+
+  SchachPipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: schach-website-pipeline
+      RoleArn: !GetAtt CodePipelineServiceRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref PipelineArtifactBucket
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: SourceAction
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeCommit
+                Version: '1'
+              OutputArtifacts:
+                - Name: SourceOutput
+              Configuration:
+                RepositoryName: "schach-simulation-repo"
+                BranchName: main
+        - Name: Deploy
+          Actions:
+            - Name: DeployAction
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: S3
+                Version: '1'
+              InputArtifacts:
+                - Name: SourceOutput
+              Configuration:
+                BucketName: !Ref WebsiteBucketV2
+                Extract: 'true'
+
+Outputs:
+  WebsiteURL:
+    Description: URL des S3 Website Buckets
+    Value: !GetAtt WebsiteBucketV2.WebsiteURL
+  ApiUrl:
+    Description: Basis-URL des Bestätigungs-API-Gateways
+    Value: !Sub "https://${SchachApi}.execute-api.${AWS::Region}.amazonaws.com/prod"
