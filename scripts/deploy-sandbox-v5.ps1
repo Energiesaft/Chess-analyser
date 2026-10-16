@@ -181,21 +181,49 @@ try {
     if ($apiOut.Count -ne 1 -or [string]::IsNullOrWhiteSpace([string]$apiOut[0].OutputValue)) {
         throw "UploadApiUrl output is missing; frontend upload skipped."
     }
-    $apiBase = [string]$apiOut[0].OutputValue
-    if ($apiBase -notmatch '^https://[a-z0-9]+\.execute-api\.[a-z0-9-]+\.amazonaws\.com/prod/?$') {
-        throw "UploadApiUrl has an unexpected format; frontend upload skipped."
+    # UploadApiUrl already contains /prod/upload in the CloudFormation outputs.
+    $uploadApiUrl = ([string]$apiOut[0].OutputValue).TrimEnd('/')
+    if ($uploadApiUrl -notmatch '^https://[a-z0-9]+\.execute-api\.[a-z0-9-]+\.amazonaws\.com/prod/upload
+    Invoke-Aws -AwsArgs @("cloudformation","describe-stacks","--stack-name",$StackName,"--region",$Region,"--query","Stacks[0].Outputs[*].[OutputKey,OutputValue]","--output","table") | Out-Host
+    Write-Host "Deployment completed. No AWS resources were automatically deleted."
+    Write-Host "Retained template: s3://$bootstrap/$templateKey"
+}
+catch {
+    Write-Error $_
+    if ($changeSetCreated -and -not $changeSetExecuted -and $changeSetName) {
+        Write-Warning "Unexecuted change set may remain: $changeSetName. It was not automatically deleted."
+    }
+    if ($templateKey) { Write-Warning "Template object may remain for audit: $templateKey" }
+    throw
+}
+finally {
+    if ($tempIndex -and (Test-Path -LiteralPath $tempIndex)) {
+        Remove-Item -LiteralPath $tempIndex -Force -ErrorAction SilentlyContinue
+    }
+    if ($null -eq $oldPythonUtf8) { Remove-Item Env:PYTHONUTF8 -ErrorAction SilentlyContinue } else { $env:PYTHONUTF8 = $oldPythonUtf8 }
+    if ($null -eq $oldAwsEncoding) { Remove-Item Env:AWS_CLI_FILE_ENCODING -ErrorAction SilentlyContinue } else { $env:AWS_CLI_FILE_ENCODING = $oldAwsEncoding }
+}
+) {
+        throw "UploadApiUrl has an unexpected format: $uploadApiUrl"
     }
 
     $html = [System.IO.File]::ReadAllText($indexSource,[System.Text.Encoding]::UTF8)
     $pattern = 'https://[a-z0-9]+\.execute-api\.[a-z0-9-]+\.amazonaws\.com/prod/upload'
-    if (-not [regex]::IsMatch($html,$pattern)) { throw "Expected API URL pattern not found in index1.2.html; refusing to publish." }
-    $html = [regex]::Replace($html,$pattern,[System.Text.RegularExpressions.MatchEvaluator]{ param($m) $apiBase.TrimEnd('/') + "/upload" })
+    if (-not [regex]::IsMatch($html,$pattern)) { throw "Expected API Gateway /prod/upload URL not found in index1.2.html; refusing to publish." }
+    $html = [regex]::Replace($html,$pattern,[System.Text.RegularExpressions.MatchEvaluator]{ param($m) $uploadApiUrl })
     [System.IO.File]::WriteAllText($tempIndex,$html,[System.Text.UTF8Encoding]::new($false))
 
     $bucket = [string]$website[0].PhysicalResourceId
-    Write-Host "Publishing frontend to s3://$bucket/"
+    Write-Host "Publishing index1.2.html as index.html to s3://$bucket with API $uploadApiUrl"
     Invoke-Aws -AwsArgs @("s3","cp",$tempIndex,"s3://$bucket/index.html","--content-type","text/html; charset=utf-8","--region",$Region) | Out-Host
-    Invoke-Aws -AwsArgs @("s3","cp",$errorSource,"s3://$bucket/error.html","--content-type","text/html; charset=utf-8","--region",$Region) | Out-Host
+    if ((Test-Path -LiteralPath $errorSource -PathType Leaf) -and (Get-Item -LiteralPath $errorSource).Length -gt 0) {
+        Invoke-Aws -AwsArgs @("s3","cp",$errorSource,"s3://$bucket/error.html","--content-type","text/html; charset=utf-8","--region",$Region) | Out-Host
+    } else {
+        Write-Warning "error.html is empty or missing; skipping optional error page upload."
+    }
+    $head = Get-AwsJson -AwsArgs @("s3api","head-object","--bucket",$bucket,"--key","index.html","--region",$Region,"--output","json")
+    if ([long]$head.ContentLength -le 0) { throw "Frontend verification failed: s3://$bucket/index.html is empty." }
+    Write-Host "Frontend upload verified ($($head.ContentLength) bytes)." -ForegroundColor Green
     Invoke-Aws -AwsArgs @("cloudformation","describe-stacks","--stack-name",$StackName,"--region",$Region,"--query","Stacks[0].Outputs[*].[OutputKey,OutputValue]","--output","table") | Out-Host
     Write-Host "Deployment completed. No AWS resources were automatically deleted."
     Write-Host "Retained template: s3://$bootstrap/$templateKey"
