@@ -116,9 +116,9 @@ try {
     Invoke-Aws -AwsArgs @("cloudformation","validate-template","--template-url",$templateUrl,"--region",$Region,"--output","json") | Out-Host
 
     $isUpdate = $false
-    # In PowerShell 7, native stderr can become a terminating NativeCommandError
-    # under ErrorActionPreference=Stop, even when a non-zero exit is expected.
-    # Temporarily relax it so a missing stack selects CREATE instead of aborting.
+    # PowerShell 7 can promote native AWS CLI stderr to NativeCommandError when
+    # ErrorActionPreference=Stop. Capture the probe safely, then classify the
+    # result: only a confirmed "stack does not exist" response may select CREATE.
     $previousErrorActionPreference = $ErrorActionPreference
     try {
         $ErrorActionPreference = "Continue"
@@ -134,6 +134,13 @@ try {
         Write-Host "Existing stack status: $status"
         if ($status -match 'IN_PROGRESS|REVIEW_IN_PROGRESS|ROLLBACK_FAILED|UPDATE_FAILED|DELETE_FAILED') {
             throw "Stack status '$status' is not a safe starting point. Inspect it in AWS Console first."
+        }
+    } else {
+        $probeText = (@($stackProbeOutput) | ForEach-Object { "$_" }) -join [Environment]::NewLine
+        if ($probeText -match '(?i)(Stack with id .* does not exist|Stack .* does not exist|does not exist)') {
+            Write-Host "Stack '$StackName' does not exist; selecting CREATE."
+        } else {
+            throw "Could not determine whether stack '$StackName' exists (AWS CLI exit code $stackProbeExitCode). Refusing to assume CREATE. AWS output: $probeText"
         }
     }
 
