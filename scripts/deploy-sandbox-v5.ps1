@@ -83,20 +83,27 @@ try {
 
     # A failed HEAD may mean denied access, wrong region, or missing bucket.
     # Try create once; any failure aborts rather than silently assuming absence.
-    & aws s3api head-bucket --bucket $bootstrap --region $Region 2>$null
+    $headOutput = & aws s3api head-bucket --bucket $bootstrap --region $Region 2>&1
     $headCode = $LASTEXITCODE
     if ($headCode -eq 0) {
+        Write-Host "Bootstrap bucket already exists and is accessible; verifying security settings."
         Test-BucketSecurity -Bucket $bootstrap
     } else {
-        Write-Host "HEAD check failed; attempting one create. If access is denied, the script will stop."
-        if ($Region -eq "us-east-1") {
-            Invoke-Aws -AwsArgs @("s3api","create-bucket","--bucket",$bootstrap,"--region",$Region,"--output","json") | Out-Host
-        } else {
-            Invoke-Aws -AwsArgs @("s3api","create-bucket","--bucket",$bootstrap,"--region",$Region,"--create-bucket-configuration","LocationConstraint=$Region","--output","json") | Out-Host
+        Write-Host "Bootstrap bucket is not accessible via HEAD; attempting one create operation."
+        if ($headOutput) { Write-Host ("HEAD diagnostic: " + (($headOutput | ForEach-Object { "$_" }) -join " ")) }
+        try {
+            if ($Region -eq "us-east-1") {
+                Invoke-Aws -AwsArgs @("s3api","create-bucket","--bucket",$bootstrap,"--region",$Region,"--output","json") | Out-Host
+            } else {
+                Invoke-Aws -AwsArgs @("s3api","create-bucket","--bucket",$bootstrap,"--region",$Region,"--create-bucket-configuration","LocationConstraint=$Region","--output","json") | Out-Host
+            }
+        } catch {
+            throw "Could not access or create bootstrap bucket '$bootstrap'. HEAD exit code: $headCode. HEAD output: $((@($headOutput) | ForEach-Object { "$_" }) -join ' '). Create error: $($_.Exception.Message). Check bucket existence, region, and IAM permissions; no fallback or deletion was attempted."
         }
         Invoke-Aws -AwsArgs @("s3api","put-public-access-block","--bucket",$bootstrap,"--region",$Region,"--public-access-block-configuration","BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true") | Out-Host
         Invoke-Aws -AwsArgs @("s3api","put-bucket-encryption","--bucket",$bootstrap,"--region",$Region,"--server-side-encryption-configuration",'{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}') | Out-Host
         Test-BucketSecurity -Bucket $bootstrap
+        Write-Host "Bootstrap bucket created, locked down, and encryption verified." -ForegroundColor Green
     }
 
     $templateKey = "cloudformation-templates/Schachformation1.8-$((Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssZ'))-$([guid]::NewGuid().ToString('N').Substring(0,8)).yml"
@@ -120,7 +127,7 @@ try {
     $changeSetName = "review-" + (Get-Date).ToUniversalTime().ToString("yyyyMMddTHHmmssZ") + "-" + [guid]::NewGuid().ToString("N").Substring(0,8)
     $type = if ($isUpdate) { "UPDATE" } else { "CREATE" }
     Write-Host "Creating a CloudFormation change set ($type). The stack will not be changed until approval."
-    Invoke-Aws -AwsArgs @("cloudformation","create-change-set","--stack-name",$StackName,"--change-set-name",$changeSetName,"--change-set-type",$type,"--template-url",$templateUrl,"--capabilities","CAPABILITY_IAM","--region",$Region,"--tags","Project=Chess-analyser","ManagedBy=CloudFormation","--output","json") | Out-Host
+    Invoke-Aws -AwsArgs @("cloudformation","create-change-set","--stack-name",$StackName,"--change-set-name",$changeSetName,"--change-set-type",$type,"--template-url",$templateUrl,"--capabilities","CAPABILITY_IAM","--region",$Region,"--tags","Key=Project,Value=Chess-analyser","Key=ManagedBy,Value=CloudFormation","--output","json") | Out-Host
     $changeSetCreated = $true
     # Poll instead of using the AWS waiter: a valid no-op change set can end in FAILED
     # with a "no changes" reason, which the waiter would otherwise treat as an opaque error.
@@ -216,7 +223,10 @@ try {
     Write-Host "Retained template: s3://$bootstrap/$templateKey"
 }
 catch {
-    Write-Error $_
+    Write-Host ("DEPLOYMENT FAILED: " + $_.Exception.Message) -ForegroundColor Red
+    if ($_.InvocationInfo -and $_.InvocationInfo.PositionMessage) {
+        Write-Host $_.InvocationInfo.PositionMessage -ForegroundColor DarkYellow
+    }
     if ($changeSetCreated -and -not $changeSetExecuted -and $changeSetName) {
         Write-Warning "Unexecuted change set may remain: $changeSetName. It was not automatically deleted."
     }
