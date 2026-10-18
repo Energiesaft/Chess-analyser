@@ -60,8 +60,11 @@ try {
     $indexSource = Join-Path $root "index1.2.html"
     $errorSource = Join-Path $root "error.html"
     $tempIndex = Join-Path $env:TEMP ("chess-index-" + [guid]::NewGuid().ToString("N") + ".html")
-    foreach ($file in @($template,$indexSource,$errorSource)) {
+    foreach ($file in @($template,$indexSource)) {
         if (-not (Test-Path -LiteralPath $file -PathType Leaf)) { throw "Required file is missing: $file" }
+    }
+    if (-not (Test-Path -LiteralPath $errorSource -PathType Leaf)) {
+        Write-Warning "error.html is missing; it will be skipped during frontend publishing."
     }
 
     Write-Host ([Environment]::NewLine + "=== Deployment preflight ===") -ForegroundColor Cyan
@@ -113,8 +116,18 @@ try {
     Invoke-Aws -AwsArgs @("cloudformation","validate-template","--template-url",$templateUrl,"--region",$Region,"--output","json") | Out-Host
 
     $isUpdate = $false
-    & aws cloudformation describe-stacks --stack-name $StackName --region $Region --output json 2>$null | Out-Null
-    if ($LASTEXITCODE -eq 0) {
+    # In PowerShell 7, native stderr can become a terminating NativeCommandError
+    # under ErrorActionPreference=Stop, even when a non-zero exit is expected.
+    # Temporarily relax it so a missing stack selects CREATE instead of aborting.
+    $previousErrorActionPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = "Continue"
+        $stackProbeOutput = & aws cloudformation describe-stacks --stack-name $StackName --region $Region --output json 2>&1
+        $stackProbeExitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+    if ($stackProbeExitCode -eq 0) {
         $isUpdate = $true
         $stack = Get-AwsJson -AwsArgs @("cloudformation","describe-stacks","--stack-name",$StackName,"--region",$Region,"--output","json")
         $status = [string]$stack.Stacks[0].StackStatus
