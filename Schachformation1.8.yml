@@ -2099,6 +2099,142 @@ Resources:
 
 
 
+  # 15a. Reconciliation: verarbeitet PENDING-Submissions,
+  # sobald die E-Mail-SNS-Subscription bestätigt wurde.
+  ConfirmedSubscriptionReconcilerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: ReconcileConfirmedSubscriptions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:Scan
+                Resource:
+                  - !GetAtt SchachSubmissionsTable.Arn
+              - Effect: Allow
+                Action:
+                  - sns:ListSubscriptionsByTopic
+                Resource:
+                  - !Ref SchachNotificationTopic
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource:
+                  - !GetAtt SchachConfirmLambda.Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*"
+
+  ConfirmedSubscriptionReconciler:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt ConfirmedSubscriptionReconcilerRole.Arn
+      Runtime: python3.11
+      Timeout: 60
+      MemorySize: 128
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref SchachSubmissionsTable
+          SNS_TOPIC_ARN: !Ref SchachNotificationTopic
+          CONFIRM_LAMBDA_ARN: !GetAtt SchachConfirmLambda.Arn
+      Code:
+        ZipFile: |
+          import os
+          import boto3
+          from boto3.dynamodb.conditions import Attr
+
+          dynamodb = boto3.resource('dynamodb')
+          sns = boto3.client('sns')
+          lam = boto3.client('lambda')
+          table = dynamodb.Table(os.environ['TABLE_NAME'])
+          topic_arn = os.environ['SNS_TOPIC_ARN']
+          confirm_lambda_arn = os.environ['CONFIRM_LAMBDA_ARN']
+
+          def lambda_handler(event, context):
+              confirmed_emails = set()
+              next_token = None
+              while True:
+                  args = {'TopicArn': topic_arn}
+                  if next_token:
+                      args['NextToken'] = next_token
+                  page = sns.list_subscriptions_by_topic(**args)
+                  for sub in page.get('Subscriptions', []):
+                      arn = sub.get('SubscriptionArn', '')
+                      endpoint = sub.get('Endpoint', '').strip().lower()
+                      if (sub.get('Protocol') == 'email' and endpoint
+                              and arn and arn.lower() not in
+                              ('pending confirmation', 'pendingconfirmation')):
+                          confirmed_emails.add(endpoint)
+                  next_token = page.get('NextToken')
+                  if not next_token:
+                      break
+
+              scanned = 0
+              invoked = 0
+              last_key = None
+              while True:
+                  args = {
+                      'FilterExpression': Attr('Status').eq('PENDING')
+                          & Attr('ExpiresAt').gt(int(__import__('time').time()))
+                  }
+                  if last_key:
+                      args['ExclusiveStartKey'] = last_key
+                  page = table.scan(**args)
+                  for item in page.get('Items', []):
+                      scanned += 1
+                      email = item.get('Email', '').strip().lower()
+                      token = item.get('Token')
+                      if email in confirmed_emails and token:
+                          lam.invoke(
+                              FunctionName=confirm_lambda_arn,
+                              InvocationType='Event',
+                              Payload=__import__('json').dumps({
+                                  'queryStringParameters': {'token': token}
+                              }).encode('utf-8')
+                          )
+                          invoked += 1
+                          print(f"Verarbeitung angestoßen für Token {token}")
+                  last_key = page.get('LastEvaluatedKey')
+                  if not last_key:
+                      break
+              print(f"Reconciliation beendet: {scanned} PENDING-Einträge geprüft, {invoked} Aufrufe ausgelöst.")
+              return {'checked': scanned, 'invoked': invoked}
+
+  ConfirmedSubscriptionReconcilerSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Prüft jede Minute, ob SNS-E-Mail-Subscriptions bestätigt wurden
+      ScheduleExpression: rate(1 minute)
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt ConfirmedSubscriptionReconciler.Arn
+          Id: ConfirmedSubscriptionReconcilerTarget
+
+  ConfirmedSubscriptionReconcilerSchedulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ConfirmedSubscriptionReconciler
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ConfirmedSubscriptionReconcilerSchedule.Arn
+
   # 16. API Gateway
   SchachApi:
     Type: AWS::ApiGateway::RestApi
