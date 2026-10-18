@@ -187,35 +187,18 @@ try {
     }
     # UploadApiUrl already contains /prod/upload in the CloudFormation outputs.
     $uploadApiUrl = ([string]$apiOut[0].OutputValue).TrimEnd('/')
-    if ($uploadApiUrl -notmatch '^https://[a-z0-9]+\.execute-api\.[a-z0-9-]+\.amazonaws\.com/prod/upload
-    Invoke-Aws -AwsArgs @("cloudformation","describe-stacks","--stack-name",$StackName,"--region",$Region,"--query","Stacks[0].Outputs[*].[OutputKey,OutputValue]","--output","table") | Out-Host
-    Write-Host "Deployment completed. No AWS resources were automatically deleted."
-    Write-Host "Retained template: s3://$bootstrap/$templateKey"
-}
-catch {
-    Write-Error $_
-    if ($changeSetCreated -and -not $changeSetExecuted -and $changeSetName) {
-        Write-Warning "Unexecuted change set may remain: $changeSetName. It was not automatically deleted."
-    }
-    if ($templateKey) { Write-Warning "Template object may remain for audit: $templateKey" }
-    throw
-}
-finally {
-    if ($tempIndex -and (Test-Path -LiteralPath $tempIndex)) {
-        Remove-Item -LiteralPath $tempIndex -Force -ErrorAction SilentlyContinue
-    }
-    if ($null -eq $oldPythonUtf8) { Remove-Item Env:PYTHONUTF8 -ErrorAction SilentlyContinue } else { $env:PYTHONUTF8 = $oldPythonUtf8 }
-    if ($null -eq $oldAwsEncoding) { Remove-Item Env:AWS_CLI_FILE_ENCODING -ErrorAction SilentlyContinue } else { $env:AWS_CLI_FILE_ENCODING = $oldAwsEncoding }
-}
-) {
+
+    if ($uploadApiUrl -notmatch '^https://[a-z0-9]+\.execute-api\.[a-z0-9-]+\.amazonaws\.com/prod/upload$') {
         throw "UploadApiUrl has an unexpected format: $uploadApiUrl"
     }
 
-    $html = [System.IO.File]::ReadAllText($indexSource,[System.Text.Encoding]::UTF8)
+    $html = [System.IO.File]::ReadAllText($indexSource, [System.Text.Encoding]::UTF8)
     $pattern = 'https://[a-z0-9]+\.execute-api\.[a-z0-9-]+\.amazonaws\.com/prod/upload'
-    if (-not [regex]::IsMatch($html,$pattern)) { throw "Expected API Gateway /prod/upload URL not found in index1.2.html; refusing to publish." }
-    $html = [regex]::Replace($html,$pattern,[System.Text.RegularExpressions.MatchEvaluator]{ param($m) $uploadApiUrl })
-    [System.IO.File]::WriteAllText($tempIndex,$html,[System.Text.UTF8Encoding]::new($false))
+    if (-not [regex]::IsMatch($html, $pattern)) {
+        throw "Expected API Gateway /prod/upload URL not found in index1.2.html; refusing to publish."
+    }
+    $html = [regex]::Replace($html, $pattern, [System.Text.RegularExpressions.MatchEvaluator]{ param($m) $uploadApiUrl })
+    [System.IO.File]::WriteAllText($tempIndex, $html, [System.Text.UTF8Encoding]::new($false))
 
     $bucket = [string]$website[0].PhysicalResourceId
     Write-Host "Publishing index1.2.html as index.html to s3://$bucket with API $uploadApiUrl"
