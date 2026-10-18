@@ -56,12 +56,15 @@ function Test-BucketSecurity {
 
 try {
     $root = Split-Path -Parent $PSScriptRoot
-    $template = Join-Path $root "Schachformation1.7_SNS_IAM_Fix.yml"
+    $template = Join-Path $root "Schachformation1.8.yml"
     $indexSource = Join-Path $root "index1.2.html"
     $errorSource = Join-Path $root "error.html"
     $tempIndex = Join-Path $env:TEMP ("chess-index-" + [guid]::NewGuid().ToString("N") + ".html")
-    foreach ($file in @($template,$indexSource,$errorSource)) {
+    foreach ($file in @($template,$indexSource)) {
         if (-not (Test-Path -LiteralPath $file -PathType Leaf)) { throw "Required file is missing: $file" }
+    }
+    if (-not (Test-Path -LiteralPath $errorSource -PathType Leaf)) {
+        Write-Warning "error.html is missing; it will be skipped during frontend publishing."
     }
 
     Write-Host ([Environment]::NewLine + "=== Deployment preflight ===") -ForegroundColor Cyan
@@ -83,31 +86,48 @@ try {
 
     # A failed HEAD may mean denied access, wrong region, or missing bucket.
     # Try create once; any failure aborts rather than silently assuming absence.
-    & aws s3api head-bucket --bucket $bootstrap --region $Region 2>$null
+    $headOutput = & aws s3api head-bucket --bucket $bootstrap --region $Region 2>&1
     $headCode = $LASTEXITCODE
     if ($headCode -eq 0) {
+        Write-Host "Bootstrap bucket already exists and is accessible; verifying security settings."
         Test-BucketSecurity -Bucket $bootstrap
     } else {
-        Write-Host "HEAD check failed; attempting one create. If access is denied, the script will stop."
-        if ($Region -eq "us-east-1") {
-            Invoke-Aws -AwsArgs @("s3api","create-bucket","--bucket",$bootstrap,"--region",$Region,"--output","json") | Out-Host
-        } else {
-            Invoke-Aws -AwsArgs @("s3api","create-bucket","--bucket",$bootstrap,"--region",$Region,"--create-bucket-configuration","LocationConstraint=$Region","--output","json") | Out-Host
+        Write-Host "Bootstrap bucket is not accessible via HEAD; attempting one create operation."
+        if ($headOutput) { Write-Host ("HEAD diagnostic: " + (($headOutput | ForEach-Object { "$_" }) -join " ")) }
+        try {
+            if ($Region -eq "us-east-1") {
+                Invoke-Aws -AwsArgs @("s3api","create-bucket","--bucket",$bootstrap,"--region",$Region,"--output","json") | Out-Host
+            } else {
+                Invoke-Aws -AwsArgs @("s3api","create-bucket","--bucket",$bootstrap,"--region",$Region,"--create-bucket-configuration","LocationConstraint=$Region","--output","json") | Out-Host
+            }
+        } catch {
+            throw "Could not access or create bootstrap bucket '$bootstrap'. HEAD exit code: $headCode. HEAD output: $((@($headOutput) | ForEach-Object { "$_" }) -join ' '). Create error: $($_.Exception.Message). Check bucket existence, region, and IAM permissions; no fallback or deletion was attempted."
         }
         Invoke-Aws -AwsArgs @("s3api","put-public-access-block","--bucket",$bootstrap,"--region",$Region,"--public-access-block-configuration","BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true") | Out-Host
         Invoke-Aws -AwsArgs @("s3api","put-bucket-encryption","--bucket",$bootstrap,"--region",$Region,"--server-side-encryption-configuration",'{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}') | Out-Host
         Test-BucketSecurity -Bucket $bootstrap
+        Write-Host "Bootstrap bucket created, locked down, and encryption verified." -ForegroundColor Green
     }
 
-    $templateKey = "cloudformation-templates/Schachformation1.7_SNS_IAM_Fix-$((Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssZ'))-$([guid]::NewGuid().ToString('N').Substring(0,8)).yml"
+    $templateKey = "cloudformation-templates/Schachformation1.8-$((Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssZ'))-$([guid]::NewGuid().ToString('N').Substring(0,8)).yml"
     $templateUrl = "https://$bootstrap.s3.$Region.amazonaws.com/$templateKey"
     Write-Host "Uploading versioned template to s3://$bootstrap/$templateKey"
     Invoke-Aws -AwsArgs @("s3","cp",$template,"s3://$bootstrap/$templateKey","--content-type","text/yaml; charset=utf-8","--region",$Region) | Out-Host
     Invoke-Aws -AwsArgs @("cloudformation","validate-template","--template-url",$templateUrl,"--region",$Region,"--output","json") | Out-Host
 
     $isUpdate = $false
-    & aws cloudformation describe-stacks --stack-name $StackName --region $Region --output json 2>$null | Out-Null
-    if ($LASTEXITCODE -eq 0) {
+    # In PowerShell 7, native stderr can become a terminating NativeCommandError
+    # under ErrorActionPreference=Stop, even when a non-zero exit is expected.
+    # Temporarily relax it so a missing stack selects CREATE instead of aborting.
+    $previousErrorActionPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = "Continue"
+        $stackProbeOutput = & aws cloudformation describe-stacks --stack-name $StackName --region $Region --output json 2>&1
+        $stackProbeExitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+    if ($stackProbeExitCode -eq 0) {
         $isUpdate = $true
         $stack = Get-AwsJson -AwsArgs @("cloudformation","describe-stacks","--stack-name",$StackName,"--region",$Region,"--output","json")
         $status = [string]$stack.Stacks[0].StackStatus
@@ -120,7 +140,7 @@ try {
     $changeSetName = "review-" + (Get-Date).ToUniversalTime().ToString("yyyyMMddTHHmmssZ") + "-" + [guid]::NewGuid().ToString("N").Substring(0,8)
     $type = if ($isUpdate) { "UPDATE" } else { "CREATE" }
     Write-Host "Creating a CloudFormation change set ($type). The stack will not be changed until approval."
-    Invoke-Aws -AwsArgs @("cloudformation","create-change-set","--stack-name",$StackName,"--change-set-name",$changeSetName,"--change-set-type",$type,"--template-url",$templateUrl,"--capabilities","CAPABILITY_IAM","--region",$Region,"--tags","Project=Chess-analyser","ManagedBy=CloudFormation","--output","json") | Out-Host
+    Invoke-Aws -AwsArgs @("cloudformation","create-change-set","--stack-name",$StackName,"--change-set-name",$changeSetName,"--change-set-type",$type,"--template-url",$templateUrl,"--capabilities","CAPABILITY_IAM","--region",$Region,"--tags","Key=Project,Value=Chess-analyser","Key=ManagedBy,Value=CloudFormation","--output","json") | Out-Host
     $changeSetCreated = $true
     # Poll instead of using the AWS waiter: a valid no-op change set can end in FAILED
     # with a "no changes" reason, which the waiter would otherwise treat as an opaque error.
@@ -134,15 +154,18 @@ try {
         throw "Timed out waiting for change set creation. Inspect change set '$changeSetName' in AWS Console."
     }
 
+    $noStackChanges = $false
     if ($cs.Status -ne "CREATE_COMPLETE") {
         if ($cs.StatusReason -match "didn't contain changes|No updates are to be performed") {
-            Write-Host "No stack changes detected. Nothing will be executed."
-            return
+            Write-Host "No stack changes detected. Skipping stack execution and continuing to frontend publishing."
+            $noStackChanges = $true
+        } else {
+            throw "Change set is not ready: $($cs.Status) - $($cs.StatusReason)"
         }
-        throw "Change set is not ready: $($cs.Status) - $($cs.StatusReason)"
     }
 
-    Write-Host ([Environment]::NewLine + "=== PROPOSED CLOUDFORMATION CHANGES ===") -ForegroundColor Yellow
+    if (-not $noStackChanges) {
+        Write-Host ([Environment]::NewLine + "=== PROPOSED CLOUDFORMATION CHANGES ===") -ForegroundColor Yellow
     $rows = @($cs.Changes | ForEach-Object {
         [pscustomobject]@{
             Action = $_.ResourceChange.Action
@@ -170,6 +193,7 @@ try {
     } else {
         Invoke-Aws -AwsArgs @("cloudformation","wait","stack-update-complete","--stack-name",$StackName,"--region",$Region) | Out-Host
     }
+    } # end if (-not $noStackChanges)
 
     $resources = Get-AwsJson -AwsArgs @("cloudformation","describe-stack-resources","--stack-name",$StackName,"--region",$Region,"--output","json")
     $website = @($resources.StackResources | Where-Object { $_.LogicalResourceId -eq "WebsiteBucketV2" })
@@ -181,27 +205,41 @@ try {
     if ($apiOut.Count -ne 1 -or [string]::IsNullOrWhiteSpace([string]$apiOut[0].OutputValue)) {
         throw "UploadApiUrl output is missing; frontend upload skipped."
     }
-    $apiBase = [string]$apiOut[0].OutputValue
-    if ($apiBase -notmatch '^https://[a-z0-9]+\.execute-api\.[a-z0-9-]+\.amazonaws\.com/prod/?$') {
-        throw "UploadApiUrl has an unexpected format; frontend upload skipped."
+    # UploadApiUrl already contains /prod/upload in the CloudFormation outputs.
+    $uploadApiUrl = ([string]$apiOut[0].OutputValue).TrimEnd('/')
+
+    if ($uploadApiUrl -notmatch '^https://[a-z0-9]+\.execute-api\.[a-z0-9-]+\.amazonaws\.com/prod/upload$') {
+        throw "UploadApiUrl has an unexpected format: $uploadApiUrl"
     }
 
-    $html = [System.IO.File]::ReadAllText($indexSource,[System.Text.Encoding]::UTF8)
+    $html = [System.IO.File]::ReadAllText($indexSource, [System.Text.Encoding]::UTF8)
     $pattern = 'https://[a-z0-9]+\.execute-api\.[a-z0-9-]+\.amazonaws\.com/prod/upload'
-    if (-not [regex]::IsMatch($html,$pattern)) { throw "Expected API URL pattern not found in index1.2.html; refusing to publish." }
-    $html = [regex]::Replace($html,$pattern,[System.Text.RegularExpressions.MatchEvaluator]{ param($m) $apiBase.TrimEnd('/') + "/upload" })
-    [System.IO.File]::WriteAllText($tempIndex,$html,[System.Text.UTF8Encoding]::new($false))
+    if (-not [regex]::IsMatch($html, $pattern)) {
+        throw "Expected API Gateway /prod/upload URL not found in index1.2.html; refusing to publish."
+    }
+    $html = [regex]::Replace($html, $pattern, [System.Text.RegularExpressions.MatchEvaluator]{ param($m) $uploadApiUrl })
+    [System.IO.File]::WriteAllText($tempIndex, $html, [System.Text.UTF8Encoding]::new($false))
 
     $bucket = [string]$website[0].PhysicalResourceId
-    Write-Host "Publishing frontend to s3://$bucket/"
+    Write-Host "Publishing index1.2.html as index.html to s3://$bucket with API $uploadApiUrl"
     Invoke-Aws -AwsArgs @("s3","cp",$tempIndex,"s3://$bucket/index.html","--content-type","text/html; charset=utf-8","--region",$Region) | Out-Host
-    Invoke-Aws -AwsArgs @("s3","cp",$errorSource,"s3://$bucket/error.html","--content-type","text/html; charset=utf-8","--region",$Region) | Out-Host
+    if ((Test-Path -LiteralPath $errorSource -PathType Leaf) -and (Get-Item -LiteralPath $errorSource).Length -gt 0) {
+        Invoke-Aws -AwsArgs @("s3","cp",$errorSource,"s3://$bucket/error.html","--content-type","text/html; charset=utf-8","--region",$Region) | Out-Host
+    } else {
+        Write-Warning "error.html is empty or missing; skipping optional error page upload."
+    }
+    $head = Get-AwsJson -AwsArgs @("s3api","head-object","--bucket",$bucket,"--key","index.html","--region",$Region,"--output","json")
+    if ([long]$head.ContentLength -le 0) { throw "Frontend verification failed: s3://$bucket/index.html is empty." }
+    Write-Host "Frontend upload verified ($($head.ContentLength) bytes)." -ForegroundColor Green
     Invoke-Aws -AwsArgs @("cloudformation","describe-stacks","--stack-name",$StackName,"--region",$Region,"--query","Stacks[0].Outputs[*].[OutputKey,OutputValue]","--output","table") | Out-Host
     Write-Host "Deployment completed. No AWS resources were automatically deleted."
     Write-Host "Retained template: s3://$bootstrap/$templateKey"
 }
 catch {
-    Write-Error $_
+    Write-Host ("DEPLOYMENT FAILED: " + $_.Exception.Message) -ForegroundColor Red
+    if ($_.InvocationInfo -and $_.InvocationInfo.PositionMessage) {
+        Write-Host $_.InvocationInfo.PositionMessage -ForegroundColor DarkYellow
+    }
     if ($changeSetCreated -and -not $changeSetExecuted -and $changeSetName) {
         Write-Warning "Unexecuted change set may remain: $changeSetName. It was not automatically deleted."
     }
